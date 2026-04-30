@@ -1,2 +1,9 @@
 idf_component_register(SRCS "main.c"
-                    INCLUDE_DIRS ".")
+                            "ble_advertising.c"
+                            "ble_scanning.c"
+                            "display.c"
+                            "ui.c"
+                            "buttons.c"
+                            "met_tracker.c"
+                    INCLUDE_DIRS "."
+                    REQUIRES nvs_flash bt driver)

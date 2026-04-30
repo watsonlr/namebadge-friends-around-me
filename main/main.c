@@ -23,7 +23,11 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_partition.h"
-#include "esp_ota_ops.h"
+#include "ble_advertising.h"
+#include "ble_scanning.h"
+#include "ui.h"
+#include "buttons.h"
+#include "met_tracker.h"
 
 static const char *TAG = "FRIENDS_APP";
 
@@ -31,14 +35,6 @@ static const char *TAG = "FRIENDS_APP";
 #define WIFI_CONFIG_NVS_PARTITION  "user_data"
 #define WIFI_CONFIG_NVS_NAMESPACE  "badge_cfg"
 #define WIFI_CONFIG_NVS_KEY_NICK   "nick"
-
-/* NVS Configuration (this app) */
-#define FRIENDS_NVS_NAMESPACE  "friends_app"
-#define FRIENDS_NVS_KEY_MET    "met_list"
-#define FRIENDS_NVS_KEY_COUNT  "met_count"
-
-/* Maximum people we can track as met */
-#define MAX_MET_PEOPLE 256
 
 /**
  * @brief Check if badge has been configured with a nickname via bootloader
@@ -163,30 +159,117 @@ static esp_err_t init_nvs(void)
  */
 static esp_err_t init_met_people(void)
 {
-    nvs_handle_t h;
-    esp_err_t err = nvs_open_from_partition(WIFI_CONFIG_NVS_PARTITION,
-                                           FRIENDS_NVS_NAMESPACE,
-                                           NVS_READWRITE, &h);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open friends_app namespace: %s", esp_err_to_name(err));
-        return err;
+    /* Met tracker initialization now handled by met_tracker component */
+    return met_tracker_init();
+}
+
+/**
+ * @brief Cleanup task - removes stale entries from nearby friends list
+ */
+static void cleanup_task(void *param)
+{
+    ESP_LOGI(TAG, "Cleanup task started");
+    
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(2000));  /* Run every 2 seconds */
+        ble_scanning_cleanup_stale_entries();
+    }
+}
+
+/**
+ * @brief UI refresh task - updates the display periodically
+ */
+static void ui_task(void *param)
+{
+    ESP_LOGI(TAG, "UI task started");
+    
+    while (1) {
+        ui_refresh();
+        vTaskDelay(pdMS_TO_TICKS(500));  /* Update display at 2 Hz */
+    }
+}
+
+/**
+ * @brief Callback for nearby friends list updates
+ */
+static void on_friends_update(void)
+{
+    int count = 0;
+    const nearby_friend_t *friends = ble_scanning_get_nearby_friends(&count);
+    
+    ESP_LOGI(TAG, "Nearby friends updated: %d active", count);
+    
+    /* List all active, non-met friends */
+    for (int i = 0; i < MAX_NEARBY_FRIENDS; i++) {
+        if (friends[i].is_active && !friends[i].is_met) {
+            ESP_LOGI(TAG, "  - %s (RSSI: %d dBm)", friends[i].nickname, friends[i].rssi);
+        }
     }
     
-    // Check if met_count exists, create if not
-    uint16_t count = 0;
-    err = nvs_get_u16(h, FRIENDS_NVS_KEY_COUNT, &count);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        // First run, initialize to 0
-        ESP_LOGI(TAG, "First run, initializing met people list");
-        nvs_set_u16(h, FRIENDS_NVS_KEY_COUNT, 0);
-        nvs_commit(h);
-        count = 0;
+    /* Trigger UI update */
+    ui_force_redraw();
+}
+
+/**
+ * @brief Button event callback
+ */
+static void on_button_event(button_event_t event)
+{
+    /* Only process click events for now */
+    if (event.event != BUTTON_EVENT_CLICK) {
+        return;
     }
     
-    nvs_close(h);
-    
-    ESP_LOGI(TAG, "Met people tracking initialized, count: %u", count);
-    return ESP_OK;
+    switch (event.button) {
+    case BUTTON_UP:
+        ESP_LOGI(TAG, "Button UP clicked - move selection up");
+        ui_select_up();
+        break;
+        
+    case BUTTON_DOWN:
+        ESP_LOGI(TAG, "Button DOWN clicked - move selection down");
+        ui_select_down();
+        break;
+        
+    case BUTTON_RIGHT:
+        /* Check off selected friend as met */
+        {
+            char nickname[33];
+            if (ui_get_selected_nickname(nickname, sizeof(nickname)) == ESP_OK) {
+                ESP_LOGI(TAG, "Button RIGHT clicked - marking %s as met", nickname);
+                
+                /* Mark as met in BLE scanning */
+                ble_scanning_mark_as_met(nickname);
+                
+                /* Save to persistent storage */
+                met_tracker_add(nickname);
+                
+                /* Force UI refresh */
+                ui_force_redraw();
+            } else {
+                ESP_LOGI(TAG, "Button RIGHT clicked - no friend selected");
+            }
+        }
+        break;
+        
+    case BUTTON_LEFT:
+        /* Future: undo or show met list */
+        ESP_LOGI(TAG, "Button LEFT clicked (not implemented)");
+        break;
+        
+    case BUTTON_A:
+        /* Future: reset met list */
+        ESP_LOGI(TAG, "Button A clicked (not implemented)");
+        break;
+        
+    case BUTTON_B:
+        /* Future: toggle modes */
+        ESP_LOGI(TAG, "Button B clicked (not implemented)");
+        break;
+        
+    default:
+        break;
+    }
 }
 
 /**
@@ -221,23 +304,96 @@ void app_main(void)
     // Initialize met people tracking
     ESP_ERROR_CHECK(init_met_people());
     
-    // TODO: Initialize BLE component
-    ESP_LOGI(TAG, "TODO: Initialize BLE broadcasting and scanning");
+    // Initialize BLE advertising
+    ESP_LOGI(TAG, "Initializing BLE advertising...");
+    err = ble_advertising_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize BLE advertising: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Continuing without BLE...");
+    } else {
+        // Start advertising with the badge nickname
+        err = ble_advertising_start(nickname);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start BLE advertising: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "BLE advertising started successfully");
+        }
+    }
     
-    // TODO: Initialize display component
-    ESP_LOGI(TAG, "TODO: Initialize display driver");
+    // Initialize BLE scanning
+    ESP_LOGI(TAG, "Initializing BLE scanning...");
+    err = ble_scanning_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize BLE scanning: %s", esp_err_to_name(err));
+    } else {
+        // Register update callback
+        ble_scanning_register_update_callback(on_friends_update);
+        
+        // Start scanning for nearby badges
+        vTaskDelay(pdMS_TO_TICKS(500));  /* Small delay after advertising */
+        err = ble_scanning_start();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start BLE scanning: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "BLE scanning started successfully");
+        }
+    }
     
-    // TODO: Initialize button component
-    ESP_LOGI(TAG, "TODO: Initialize button handlers");
+    // Start cleanup task
+    xTaskCreate(cleanup_task, "cleanup", 2048, NULL, 5, NULL);
     
-    // TODO: Start main application loop
+    // Initialize UI and display
+    ESP_LOGI(TAG, "Initializing display and UI...");
+    err = ui_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize UI: %s", esp_err_to_name(err));
+    } else {
+        ui_set_nickname(nickname);
+        ui_force_redraw();
+        ESP_LOGI(TAG, "Display and UI initialized successfully");
+        
+        // Start UI refresh task
+        xTaskCreate(ui_task, "ui", 4096, NULL, 5, NULL);
+    }
+    
+    // Initialize buttons
+    ESP_LOGI(TAG, "Initializing button handlers...");
+    err = buttons_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize buttons: %s", esp_err_to_name(err));
+    } else {
+        buttons_register_callback(on_button_event);
+        ESP_LOGI(TAG, "Button handlers initialized successfully");
+    }
+    
+    // Initialize buttons
+    ESP_LOGI(TAG, "Initializing button handlers...");
+    err = buttons_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize buttons: %s", esp_err_to_name(err));
+    } else {
+        buttons_register_callback(on_button_event);
+        ESP_LOGI(TAG, "Button handlers initialized successfully");
+    }
+    
+    // Application initialized
     ESP_LOGI(TAG, "Application initialized successfully");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "===========================================");
     
-    // Main loop (placeholder)
+    // Main loop
+    ESP_LOGI(TAG, "Entering main loop...");
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        ESP_LOGI(TAG, "App running... (components not yet implemented)");
+        vTaskDelay(pdMS_TO_TICKS(10000));  /* Log status every 10 seconds */
+        
+        int nearby_count = 0;
+        ble_scanning_get_nearby_friends(&nearby_count);
+        int met_count = met_tracker_get_count();
+        
+        ESP_LOGI(TAG, "Status: ADV=%s SCAN=%s Nearby=%d Met=%d",
+                 ble_advertising_is_active() ? "ON" : "OFF",
+                 ble_scanning_is_active() ? "ON" : "OFF",
+                 nearby_count,
+                 met_count);
     }
 }
