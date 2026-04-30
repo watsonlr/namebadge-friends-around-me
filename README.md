@@ -21,20 +21,24 @@ A Bluetooth Low Energy (BLE) proximity application for the BYUI eBadge V3.0 name
 
 ### Prerequisites
 
-1. BYUI eBadge with bootloader installed
+1. BYUI eBadge with bootloader installed ([BYUI-Namebadge4-OTA](https://github.com/watsonlr/BYUI-Namebadge4-OTA))
 2. Badge configured with your nickname (via bootloader portal)
 3. WiFi configured for OTA downloads
 
-### Install via Bootloader OTA Menu
+### Option 1: Install via Bootloader OTA Menu (Recommended)
+
+The easiest way to install Friends Around Me:
 
 1. Press **RESET** on your badge
 2. Within 500ms, press and hold **BOOT** button
 3. Navigate to "OTA App Download"
-4. Select "Friends Around Me" from the app catalog
-5. Wait for download to complete
+4. Select "Friends Around Me" from the app list
+5. Wait for download to complete (~565 KB)
 6. Badge automatically reboots into the app
 
-### Direct Flash (Development)
+The app will appear in your bootloader's OTA catalog if your instructor has published it.
+
+### Option 2: Direct Flash (Development)
 
 ```bash
 # Clone repository
@@ -131,6 +135,15 @@ See [LICENSE](LICENSE) file for details.
 
 - [BYUI-Namebadge4-OTA](https://github.com/watsonlr/BYUI-Namebadge4-OTA) - Bootloader and OTA framework
 - [namebadge-apps](https://github.com/watsonlr/namebadge-apps) - App catalog and manifest
+
+## Publishing to OTA Catalog
+
+Want to make this app available for OTA download? See [PUBLISHING.md](PUBLISHING.md) for complete instructions on:
+- Building and preparing the binary
+- Calculating size and SHA-256 hash
+- Uploading to GitHub Pages
+- Creating/updating the manifest JSON
+- Using the automated `publish_friends_app.sh` script
 
 ## Support
 
