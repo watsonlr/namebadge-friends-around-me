@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wsl --list --verbose)",
+      "Bash(wsl -l -v)",
+      "Bash(wsl -d Ubuntu bash -c \"ls ~/esp 2>/dev/null && echo 'esp dir exists' || echo 'no esp dir'\")",
+      "Bash(wsl -d Ubuntu bash -c \"which idf.py 2>/dev/null || echo 'idf.py not found'; python3 --version 2>/dev/null; git --version 2>/dev/null\")",
+      "Bash(wsl -d Ubuntu bash -c \"sudo apt-get update -qq && sudo apt-get install -y git wget flex bison gperf python3 python3-pip python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0 2>&1 | tail -5\")",
+      "Bash(wsl -d Ubuntu bash -c \"which cmake && which ninja && echo 'prereqs OK' || echo 'still missing'\")",
+      "Bash(wsl -d Ubuntu bash -c \"mkdir -p ~/esp && cd ~/esp && git clone --recursive --depth=1 --branch v5.3 https://github.com/espressif/esp-idf.git esp-idf 2>&1 | tail -3\")",
+      "Bash(echo \"Clone started in background PID $!\")",
+      "Bash(wsl -d Ubuntu bash -c \"test -f ~/esp/esp-idf/export.sh\")",
+      "Bash(wsl -d Ubuntu bash -c \"cd ~/esp/esp-idf && ./install.sh esp32s3 2>&1\")",
+      "Bash(echo \"Install script running in background PID $!\")",
+      "Bash(wsl -d Ubuntu bash -c \"test -f ~/.espressif/esp-idf-v5.3/idf.py\")",
+      "Bash(wsl -d Ubuntu bash -c \"ls ~/.espressif/tools/xtensa-esp-elf/*/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc 2>/dev/null | head -1 | grep -q gcc\")",
+      "Bash(wsl -d Ubuntu bash -c ' *)",
+      "Bash(echo \"Build started in background PID $!\")",
+      "Bash(wsl -d Ubuntu -u root -- bash -c \"modprobe cp210x 2>&1 && sleep 1 && ls /dev/ttyUSB* 2>&1\")"
+    ]
+  }
+}

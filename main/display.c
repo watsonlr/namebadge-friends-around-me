@@ -37,6 +37,14 @@ static const char *TAG = "DISPLAY";
 #define ILI9341_RAMWR       0x2C
 #define ILI9341_MADCTL      0x36
 #define ILI9341_COLMOD      0x3A
+#define ILI9341_FRMCTR1     0xB1
+#define ILI9341_DFUNCTR     0xB6
+#define ILI9341_PWCTR1      0xC0
+#define ILI9341_PWCTR2      0xC1
+#define ILI9341_VMCTR1      0xC5
+#define ILI9341_VMCTR2      0xC7
+#define ILI9341_GMCTRP1     0xE0
+#define ILI9341_GMCTRN1     0xE1
 
 static spi_device_handle_t spi_handle;
 
@@ -140,70 +148,67 @@ static const uint8_t font8x8[96][8] = {
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}  // DEL
 };
 
-/**
- * @brief Send command to display
- */
+/* Pre-transfer callback: sets DC pin from transaction user field (0=cmd, 1=data) */
+static void IRAM_ATTR spi_pre_cb(spi_transaction_t *t)
+{
+    gpio_set_level(PIN_DC, (int)(intptr_t)t->user);
+}
+
 static void send_command(uint8_t cmd)
 {
-    gpio_set_level(PIN_DC, 0);  /* Command mode */
-    spi_transaction_t trans = {
-        .length = 8,
-        .tx_buffer = &cmd,
-        .flags = SPI_TRANS_USE_TXDATA
+    spi_transaction_t t = {
+        .length  = 8,
+        .tx_data = {cmd},
+        .flags   = SPI_TRANS_USE_TXDATA,
+        .user    = (void *)0,   /* DC LOW = command */
     };
-    trans.tx_data[0] = cmd;
-    spi_device_polling_transmit(spi_handle, &trans);
+    spi_device_polling_transmit(spi_handle, &t);
 }
 
-/**
- * @brief Send data to display
- */
 static void send_data(uint8_t data)
 {
-    gpio_set_level(PIN_DC, 1);  /* Data mode */
-    spi_transaction_t trans = {
-        .length = 8,
-        .flags = SPI_TRANS_USE_TXDATA
+    spi_transaction_t t = {
+        .length  = 8,
+        .tx_data = {data},
+        .flags   = SPI_TRANS_USE_TXDATA,
+        .user    = (void *)1,   /* DC HIGH = data */
     };
-    trans.tx_data[0] = data;
-    spi_device_polling_transmit(spi_handle, &trans);
+    spi_device_polling_transmit(spi_handle, &t);
 }
 
-/**
- * @brief Send data buffer to display
- */
 static void send_data_buf(const uint8_t *data, size_t len)
 {
     if (len == 0) return;
-    
-    gpio_set_level(PIN_DC, 1);  /* Data mode */
-    spi_transaction_t trans = {
-        .length = len * 8,
-        .tx_buffer = data
+    spi_transaction_t t = {
+        .length    = len * 8,
+        .tx_buffer = data,
+        .user      = (void *)1,   /* DC HIGH = data */
     };
-    spi_device_polling_transmit(spi_handle, &trans);
+    spi_device_polling_transmit(spi_handle, &t);
 }
 
-/**
- * @brief Set display address window for pixel writing
- */
+/* With MADCTL=0x40 (MX=1, MV=0) the panel is portrait 240×320 with columns mirrored.
+ * Logical landscape coords (x=0..319, y=0..239) map to:
+ *   CASET (col) = (239 - y1) .. (239 - y0)   [y axis → portrait columns]
+ *   PASET (row) = (319 - x1) .. (319 - x0)   [x axis → portrait rows]
+ * This matches the working BYUI-Namebadge4-OTA bootloader driver. */
 static void set_address_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 {
-    /* Column address set */
+    uint16_t col0 = (DISPLAY_HEIGHT - 1) - y1;
+    uint16_t col1 = (DISPLAY_HEIGHT - 1) - y0;
+    uint16_t row0 = (DISPLAY_WIDTH  - 1) - x1;
+    uint16_t row1 = (DISPLAY_WIDTH  - 1) - x0;
+
+    uint8_t d[4];
+
     send_command(ILI9341_CASET);
-    send_data(x0 >> 8);
-    send_data(x0 & 0xFF);
-    send_data(x1 >> 8);
-    send_data(x1 & 0xFF);
+    d[0] = col0 >> 8; d[1] = col0 & 0xFF; d[2] = col1 >> 8; d[3] = col1 & 0xFF;
+    send_data_buf(d, 4);
 
-    /* Page address set */
     send_command(ILI9341_PASET);
-    send_data(y0 >> 8);
-    send_data(y0 & 0xFF);
-    send_data(y1 >> 8);
-    send_data(y1 & 0xFF);
+    d[0] = row0 >> 8; d[1] = row0 & 0xFF; d[2] = row1 >> 8; d[3] = row1 & 0xFF;
+    send_data_buf(d, 4);
 
-    /* Memory write */
     send_command(ILI9341_RAMWR);
 }
 
@@ -211,15 +216,16 @@ esp_err_t display_init(void)
 {
     ESP_LOGI(TAG, "Initializing ILI9341 display...");
 
-    /* Configure GPIOs */
+    /* Configure GPIOs: DC, RST, and SD card CS (GPIO3 must be deselected to avoid bus contention) */
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << PIN_DC) | (1ULL << PIN_RST),
+        .pin_bit_mask = (1ULL << PIN_DC) | (1ULL << PIN_RST) | (1ULL << 3),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE
     };
     gpio_config(&io_conf);
+    gpio_set_level(3, 1);   /* SD card CS high = deselected */
 
     /* Configure SPI bus */
     spi_bus_config_t bus_cfg = {
@@ -228,7 +234,7 @@ esp_err_t display_init(void)
         .sclk_io_num = PIN_CLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * 2
+        .max_transfer_sz = DISPLAY_WIDTH * 2 + 8
     };
     
     esp_err_t ret = spi_bus_initialize(SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
@@ -240,10 +246,10 @@ esp_err_t display_init(void)
     /* Configure SPI device */
     spi_device_interface_config_t dev_cfg = {
         .clock_speed_hz = SPI_CLOCK_SPEED_HZ,
-        .mode = 0,  /* SPI mode 0 (CPOL=0, CPHA=0) */
-        .spics_io_num = PIN_CS,
-        .queue_size = 7,
-        .flags = 0
+        .mode           = 0,
+        .spics_io_num   = PIN_CS,
+        .queue_size     = 7,
+        .pre_cb         = spi_pre_cb,   /* Sets DC pin before each transaction */
     };
     
     ret = spi_bus_add_device(SPI_HOST, &dev_cfg, &spi_handle);
@@ -252,32 +258,102 @@ esp_err_t display_init(void)
         return ret;
     }
 
-    /* Hardware reset */
+    /* Hardware reset — hold low for 20ms, then wait 120ms for panel to stabilise */
+    gpio_set_level(PIN_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(5));
     gpio_set_level(PIN_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(20));
     gpio_set_level(PIN_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(120));
 
-    /* Software reset */
+    /* Software reset, wait 150ms */
     send_command(ILI9341_SWRESET);
     vTaskDelay(pdMS_TO_TICKS(150));
 
-    /* Display off */
-    send_command(ILI9341_DISPOFF);
+    /* Power control A */
+    send_command(0xCB);
+    send_data(0x39); send_data(0x2C); send_data(0x00);
+    send_data(0x34); send_data(0x02);
 
-    /* Sleep out */
-    send_command(ILI9341_SLPOUT);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    /* Power control B */
+    send_command(0xCF);
+    send_data(0x00); send_data(0xC1); send_data(0x30);
 
-    /* Pixel format: 16-bit color (RGB565) */
-    send_command(ILI9341_COLMOD);
-    send_data(0x55);  /* 16 bits/pixel */
+    /* Driver timing control A */
+    send_command(0xE8);
+    send_data(0x85); send_data(0x00); send_data(0x78);
 
-    /* Memory access control: landscape mode, FPC on left */
+    /* Driver timing control B */
+    send_command(0xEA);
+    send_data(0x00); send_data(0x00);
+
+    /* Power on sequence */
+    send_command(0xED);
+    send_data(0x64); send_data(0x03); send_data(0x12); send_data(0x81);
+
+    /* Pump ratio */
+    send_command(0xF7);
+    send_data(0x20);
+
+    /* Power control 1 */
+    send_command(ILI9341_PWCTR1);
+    send_data(0x23);
+
+    /* Power control 2 */
+    send_command(ILI9341_PWCTR2);
+    send_data(0x10);
+
+    /* VCOM control 1 */
+    send_command(ILI9341_VMCTR1);
+    send_data(0x3E); send_data(0x28);
+
+    /* VCOM control 2 */
+    send_command(ILI9341_VMCTR2);
+    send_data(0x86);
+
+    /* Memory access control: landscape, FPC on left, BGR */
     send_command(ILI9341_MADCTL);
-    send_data(0x40);  /* MX bit only */
+    send_data(0x40);
 
-    /* Invert display colors (required for this panel) */
+    /* Pixel format: 16-bit RGB565 */
+    send_command(ILI9341_COLMOD);
+    send_data(0x55);
+
+    /* Frame rate: 79 Hz */
+    send_command(ILI9341_FRMCTR1);
+    send_data(0x00); send_data(0x18);
+
+    /* Display function control */
+    send_command(ILI9341_DFUNCTR);
+    send_data(0x08); send_data(0x82); send_data(0x27);
+
+    /* 3-gamma disable */
+    send_command(0xF2);
+    send_data(0x00);
+
+    /* Gamma curve 1 */
+    send_command(0x26);
+    send_data(0x01);
+
+    /* Positive gamma correction */
+    send_command(ILI9341_GMCTRP1);
+    send_data(0x0F); send_data(0x31); send_data(0x2B); send_data(0x0C);
+    send_data(0x0E); send_data(0x08); send_data(0x4E); send_data(0xF1);
+    send_data(0x37); send_data(0x07); send_data(0x10); send_data(0x03);
+    send_data(0x0E); send_data(0x09); send_data(0x00);
+
+    /* Negative gamma correction */
+    send_command(ILI9341_GMCTRN1);
+    send_data(0x00); send_data(0x0E); send_data(0x14); send_data(0x03);
+    send_data(0x11); send_data(0x07); send_data(0x31); send_data(0xC1);
+    send_data(0x48); send_data(0x08); send_data(0x0F); send_data(0x0C);
+    send_data(0x31); send_data(0x36); send_data(0x0F);
+
+    /* Sleep out — mandatory 120ms wait */
+    send_command(ILI9341_SLPOUT);
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    /* Invert display (required for this panel variant) */
     send_command(ILI9341_INVON);
 
     /* Display on */
@@ -310,8 +386,8 @@ void display_fill_rect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t colo
     gpio_set_level(PIN_DC, 1);  /* Data mode */
     
     uint32_t pixels = w * h;
-    const uint32_t chunk = 2048;  /* Send in chunks */
-    uint8_t buffer[chunk * 2];
+    const uint32_t chunk = 128;  /* Send in chunks */
+    static uint8_t buffer[128 * 2];
     
     /* Prepare buffer with color */
     for (uint32_t i = 0; i < chunk * 2; i += 2) {

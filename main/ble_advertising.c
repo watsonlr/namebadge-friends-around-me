@@ -8,8 +8,6 @@
 #include "ble_advertising.h"
 #include <string.h>
 #include "esp_log.h"
-#include "nvs_flash.h"
-#include "esp_nimble_hci.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -177,27 +175,12 @@ esp_err_t ble_advertising_init(void)
 {
     ESP_LOGI(TAG, "Initializing BLE advertising...");
 
-    /* Initialize NVS for NimBLE (if not already done) */
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        /* NVS partition was truncated, erase and try again */
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+    /* Initialize NimBLE controller and host (handles HCI init internally in ESP-IDF v5.x) */
+    int nimble_rc = nimble_port_init();
+    if (nimble_rc != 0) {
+        ESP_LOGE(TAG, "nimble_port_init failed: %d", nimble_rc);
+        return ESP_FAIL;
     }
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    /* Initialize NimBLE controller and host */
-    ret = esp_nimble_hci_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "HCI init failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    /* Initialize NimBLE host */
-    nimble_port_init();
 
     /* Configure the host */
     ble_hs_cfg.reset_cb = ble_on_reset;
@@ -206,9 +189,9 @@ esp_err_t ble_advertising_init(void)
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
 
     /* Set default device name */
-    ret = ble_svc_gap_device_name_set("BYUI Badge");
-    if (ret != 0) {
-        ESP_LOGE(TAG, "Failed to set device name, rc=%d", ret);
+    nimble_rc = ble_svc_gap_device_name_set("BYUI Badge");
+    if (nimble_rc != 0) {
+        ESP_LOGE(TAG, "Failed to set device name, rc=%d", nimble_rc);
         return ESP_FAIL;
     }
 
@@ -292,15 +275,8 @@ esp_err_t ble_advertising_deinit(void)
         return ESP_FAIL;
     }
 
-    /* Deinit NimBLE host */
+    /* Deinit NimBLE host and controller */
     nimble_port_deinit();
-
-    /* Deinit controller */
-    esp_err_t ret = esp_nimble_hci_deinit();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to deinit controller: %s", esp_err_to_name(ret));
-        return ret;
-    }
 
     is_advertising = false;
     ESP_LOGI(TAG, "BLE advertising deinitialized");

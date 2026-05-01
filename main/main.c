@@ -340,7 +340,7 @@ void app_main(void)
     }
     
     // Start cleanup task
-    xTaskCreate(cleanup_task, "cleanup", 2048, NULL, 5, NULL);
+    xTaskCreate(cleanup_task, "cleanup", 4096, NULL, 5, NULL);
     
     // Initialize UI and display
     ESP_LOGI(TAG, "Initializing display and UI...");
@@ -353,17 +353,7 @@ void app_main(void)
         ESP_LOGI(TAG, "Display and UI initialized successfully");
         
         // Start UI refresh task
-        xTaskCreate(ui_task, "ui", 4096, NULL, 5, NULL);
-    }
-    
-    // Initialize buttons
-    ESP_LOGI(TAG, "Initializing button handlers...");
-    err = buttons_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize buttons: %s", esp_err_to_name(err));
-    } else {
-        buttons_register_callback(on_button_event);
-        ESP_LOGI(TAG, "Button handlers initialized successfully");
+        xTaskCreate(ui_task, "ui", 8192, NULL, 5, NULL);
     }
     
     // Initialize buttons
