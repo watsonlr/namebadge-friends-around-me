@@ -29,9 +29,10 @@ typedef struct {
     char nickname[MAX_NICKNAME_LEN + 1];  /**< Friend's nickname */
     int8_t rssi;                          /**< Signal strength (dBm) */
     int64_t last_seen;                    /**< Last seen timestamp (microseconds) */
-    uint8_t addr[6];                      /**< BLE address */
+    uint8_t addr[6];                      /**< BLE address (NimBLE order: addr[0]=LSB) */
     bool is_met;                          /**< True if already met (filtered from display) */
     bool is_active;                       /**< True if slot is in use */
+    bool they_request_me;                 /**< True if their adv targets my MAC */
 } nearby_friend_t;
 
 /**

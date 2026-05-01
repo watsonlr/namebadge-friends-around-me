@@ -6,6 +6,7 @@
 #include "ui.h"
 #include "display.h"
 #include "ble_scanning.h"
+#include "ble_advertising.h"
 #include "met_tracker.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -22,11 +23,19 @@ static const char *TAG = "UI";
 #define LIST_ITEM_HEIGHT    25
 #define LIST_MAX_VISIBLE    7  /* Max items visible on screen */
 
+/* Flash state for a single friend row. */
+typedef enum {
+    ROW_FLASH_NONE = 0,
+    ROW_FLASH_RED,    /* I'm requesting them */
+    ROW_FLASH_GREEN,  /* They're requesting me */
+} row_flash_t;
+
 /* UI State */
 static char user_nickname[33] = "Badge";
 static int selected_index = 0;
 static int scroll_offset = 0;
 static bool need_redraw = true;
+static uint32_t blink_tick = 0;
 
 /**
  * @brief Draw the header with user's nickname
@@ -38,7 +47,7 @@ static void draw_header(void)
     
     /* Draw user's nickname */
     char header_text[50];
-    snprintf(header_text, sizeof(header_text), " Your Name: %s", user_nickname);
+    snprintf(header_text, sizeof(header_text), " I am: %s", user_nickname);
     display_draw_string(5, 8, header_text, COLOR_WHITE, COLOR_BLUE, 2);
     
     /* Draw separator line */
@@ -60,7 +69,7 @@ static void draw_footer(int nearby_count, int met_count)
     
     /* Draw statistics */
     char footer_text[50];
-    snprintf(footer_text, sizeof(footer_text), " Met: %d  |  Nearby: %d", met_count, nearby_count);
+    snprintf(footer_text, sizeof(footer_text), " Seen: %d   Met:%2d", nearby_count, met_count);
     display_draw_string(10, footer_y + 6, footer_text, COLOR_WHITE, COLOR_BLUE, 2);
 }
 
@@ -92,24 +101,46 @@ static void draw_signal_indicator(int16_t x, int16_t y, int8_t rssi)
 /**
  * @brief Draw a single friend list item
  */
-static void draw_list_item(int16_t y, const char *nickname, int8_t rssi, bool is_selected)
+static void draw_list_item(int16_t y, const char *nickname, int8_t rssi,
+                           bool is_selected, row_flash_t flash, bool flash_on)
 {
-    uint16_t bg_color = is_selected ? COLOR_ORANGE : COLOR_BLACK;
-    uint16_t fg_color = is_selected ? COLOR_BLACK : COLOR_WHITE;
-    
+    uint16_t bg_color = COLOR_BLACK;
+    uint16_t fg_color = COLOR_WHITE;
+
+    if (flash != ROW_FLASH_NONE && flash_on) {
+        bg_color = (flash == ROW_FLASH_RED) ? COLOR_RED : COLOR_GREEN;
+        fg_color = COLOR_BLACK;
+    } else if (is_selected) {
+        bg_color = COLOR_ORANGE;
+        fg_color = COLOR_BLACK;
+    }
+
     /* Draw background */
     display_fill_rect(0, y, DISPLAY_WIDTH, LIST_ITEM_HEIGHT, bg_color);
-    
+
     /* Draw selection indicator */
     if (is_selected) {
-        display_draw_string(5, y + 5, ">", COLOR_BLACK, bg_color, 2);
+        display_draw_string(5, y + 5, ">", fg_color, bg_color, 2);
     }
-    
+
     /* Draw nickname */
     display_draw_string(25, y + 5, nickname, fg_color, bg_color, 2);
-    
+
     /* Draw signal strength indicator */
     draw_signal_indicator(DISPLAY_WIDTH - 25, y + 7, rssi);
+}
+
+/* Decide the row's flash colour based on incoming/outgoing meet requests. */
+static row_flash_t row_flash_for(const nearby_friend_t *f, const uint8_t my_target[2])
+{
+    if (f->they_request_me) {
+        return ROW_FLASH_GREEN;
+    }
+    if ((my_target[0] || my_target[1]) &&
+        my_target[0] == f->addr[1] && my_target[1] == f->addr[0]) {
+        return ROW_FLASH_RED;
+    }
+    return ROW_FLASH_NONE;
 }
 
 /**
@@ -119,11 +150,15 @@ static void draw_friends_list(void)
 {
     int count = 0;
     const nearby_friend_t *friends = ble_scanning_get_nearby_friends(&count);
-    
+
+    uint8_t my_target[2];
+    ble_advertising_get_target(my_target);
+    bool flash_on = (blink_tick & 1) == 0;
+
     /* Clear list area */
     int list_height = DISPLAY_HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT - 10;
     display_fill_rect(0, LIST_START_Y, DISPLAY_WIDTH, list_height, COLOR_BLACK);
-    
+
     if (count == 0) {
         /* No friends nearby */
         const char *msg1 = "No friends nearby";
@@ -132,46 +167,72 @@ static void draw_friends_list(void)
         display_draw_string(90, 125, msg2, COLOR_GRAY, COLOR_BLACK, 2);
         return;
     }
-    
+
     /* Build list of active, non-met friends */
     const nearby_friend_t *active_friends[MAX_NEARBY_FRIENDS];
     int active_count = 0;
-    
+
     for (int i = 0; i < MAX_NEARBY_FRIENDS; i++) {
         if (friends[i].is_active && !friends[i].is_met) {
             active_friends[active_count++] = &friends[i];
         }
     }
-    
+
     /* Update selection bounds */
     if (selected_index >= active_count) {
         selected_index = active_count > 0 ? active_count - 1 : 0;
     }
-    
+
     /* Update scroll offset */
     if (selected_index < scroll_offset) {
         scroll_offset = selected_index;
     } else if (selected_index >= scroll_offset + LIST_MAX_VISIBLE) {
         scroll_offset = selected_index - LIST_MAX_VISIBLE + 1;
     }
-    
+
     /* Draw visible items */
     int y = LIST_START_Y;
     for (int i = 0; i < LIST_MAX_VISIBLE && (scroll_offset + i) < active_count; i++) {
         int idx = scroll_offset + i;
         bool is_selected = (idx == selected_index);
-        draw_list_item(y, active_friends[idx]->nickname, active_friends[idx]->rssi, is_selected);
+        row_flash_t flash = row_flash_for(active_friends[idx], my_target);
+        draw_list_item(y, active_friends[idx]->nickname, active_friends[idx]->rssi,
+                       is_selected, flash, flash_on);
         y += LIST_ITEM_HEIGHT;
     }
-    
+
     /* Draw scroll indicator if needed */
     if (active_count > LIST_MAX_VISIBLE) {
         int indicator_height = (LIST_MAX_VISIBLE * list_height) / active_count;
         if (indicator_height < 10) indicator_height = 10;
-        
+
         int indicator_y = LIST_START_Y + ((scroll_offset * list_height) / active_count);
         display_fill_rect(DISPLAY_WIDTH - 5, indicator_y, 3, indicator_height, COLOR_CYAN);
     }
+}
+
+/* True if any visible row is in a flashing state — used to keep ui_refresh
+ * redrawing each tick for animation, even when nothing else changed. */
+static bool any_visible_flashing(void)
+{
+    int count = 0;
+    const nearby_friend_t *friends = ble_scanning_get_nearby_friends(&count);
+    if (count == 0) return false;
+
+    uint8_t my_target[2];
+    ble_advertising_get_target(my_target);
+    bool i_have_target = (my_target[0] || my_target[1]);
+
+    for (int i = 0; i < MAX_NEARBY_FRIENDS; i++) {
+        if (!friends[i].is_active || friends[i].is_met) continue;
+        if (friends[i].they_request_me) return true;
+        if (i_have_target &&
+            my_target[0] == friends[i].addr[1] &&
+            my_target[1] == friends[i].addr[0]) {
+            return true;
+        }
+    }
+    return false;
 }
 
 esp_err_t ui_init(void)
@@ -187,15 +248,7 @@ esp_err_t ui_init(void)
     
     /* Clear screen */
     display_fill(COLOR_BLACK);
-    
-    /* Test pattern to verify display is working */
-    ESP_LOGI(TAG, "Drawing test pattern...");
-    display_fill_rect(0, 0, 100, 100, COLOR_RED);
-    display_fill_rect(100, 0, 100, 100, COLOR_GREEN);
-    display_fill_rect(200, 0, 120, 100, COLOR_BLUE);
-    display_draw_string(10, 120, "DISPLAY TEST", COLOR_WHITE, COLOR_BLACK, 2);
-    vTaskDelay(pdMS_TO_TICKS(2000));  /* Show test pattern for 2 seconds */
-    
+
     ESP_LOGI(TAG, "UI initialized successfully");
     return ESP_OK;
 }
@@ -211,22 +264,26 @@ void ui_set_nickname(const char *nickname)
 
 void ui_refresh(void)
 {
-    if (!need_redraw) {
+    bool flashing = any_visible_flashing();
+    if (!need_redraw && !flashing) {
         return;
     }
-    
-    /* Get nearby friends count */
+
+    /* Advance the blink phase only on tick-driven redraws so the on/off
+     * state stays in sync regardless of how often need_redraw fires. */
+    if (flashing) {
+        blink_tick++;
+    }
+
     int nearby_count = 0;
     ble_scanning_get_nearby_friends(&nearby_count);
-    
-    /* Get met count from tracker */
+
     int met_count = met_tracker_get_count();
-    
-    /* Draw UI components */
+
     draw_header();
     draw_friends_list();
     draw_footer(nearby_count, met_count);
-    
+
     need_redraw = false;
 }
 
@@ -306,6 +363,30 @@ esp_err_t ui_get_selected_nickname(char *nickname, size_t max_len)
     return ESP_OK;
 }
 
+esp_err_t ui_get_selected_addr(uint8_t out[6])
+{
+    int count = 0;
+    const nearby_friend_t *friends = ble_scanning_get_nearby_friends(&count);
+    if (count == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    const nearby_friend_t *active_friends[MAX_NEARBY_FRIENDS];
+    int active_count = 0;
+    for (int i = 0; i < MAX_NEARBY_FRIENDS; i++) {
+        if (friends[i].is_active && !friends[i].is_met) {
+            active_friends[active_count++] = &friends[i];
+        }
+    }
+
+    if (selected_index >= active_count) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    memcpy(out, active_friends[selected_index]->addr, 6);
+    return ESP_OK;
+}
+
 int ui_get_selected_index(void)
 {
     int count = 0;
@@ -316,6 +397,8 @@ int ui_get_selected_index(void)
 
 void ui_force_redraw(void)
 {
+    /* Just flag for redraw — the UI task picks it up on its next tick.
+     * Doing SPI display work here would blow the stack of whichever task
+     * called us (commonly the BLE host task via the scan callback). */
     need_redraw = true;
-    ui_refresh();
 }

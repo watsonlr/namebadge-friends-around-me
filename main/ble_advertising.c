@@ -20,6 +20,7 @@ static const char *TAG = "BLE_ADV";
 /* Advertisement state */
 static bool is_advertising = false;
 static char adv_nickname[BLE_ADV_MAX_NICKNAME_LEN + 1] = {0};
+static uint8_t my_target[BLE_NAMEBADGE_TARGET_LEN] = {0, 0};
 
 /* NimBLE host task handle */
 static void ble_host_task(void *param);
@@ -78,63 +79,31 @@ static int ble_advertise(void)
     struct ble_hs_adv_fields fields;
     int rc;
 
-    /* Set advertisement fields */
+    /* Build manufacturer data:
+     *   [company ID (2)][magic "BADG"(4)][meet target (2)][nickname]. */
+    uint8_t mfg_data[BLE_NAMEBADGE_MFG_HDR_LEN + BLE_ADV_MAX_NICKNAME_LEN];
+    mfg_data[0] = BLE_NAMEBADGE_MANUFACTURER_ID & 0xFF;
+    mfg_data[1] = (BLE_NAMEBADGE_MANUFACTURER_ID >> 8) & 0xFF;
+    memcpy(&mfg_data[2], BLE_NAMEBADGE_MAGIC, BLE_NAMEBADGE_MAGIC_LEN);
+    mfg_data[2 + BLE_NAMEBADGE_MAGIC_LEN]     = my_target[0];
+    mfg_data[2 + BLE_NAMEBADGE_MAGIC_LEN + 1] = my_target[1];
+
+    size_t nickname_len = strlen(adv_nickname);
+    if (nickname_len > BLE_ADV_MAX_NICKNAME_LEN) {
+        nickname_len = BLE_ADV_MAX_NICKNAME_LEN;
+    }
+    memcpy(&mfg_data[BLE_NAMEBADGE_MFG_HDR_LEN], adv_nickname, nickname_len);
+
+    /* Adv payload: just flags + mfg data. Keeps total under the 31-byte
+     * legacy limit and avoids needing a scan response. */
     memset(&fields, 0, sizeof(fields));
-
-    /* Advertise flags: general discoverable + BLE only */
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.mfg_data = mfg_data;
+    fields.mfg_data_len = BLE_NAMEBADGE_MFG_HDR_LEN + nickname_len;
 
-    /* Include TX power level */
-    fields.tx_pwr_lvl_is_present = 1;
-    fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
-
-    /* Set the device name */
-    fields.name = (uint8_t *)adv_nickname;
-    fields.name_len = strlen(adv_nickname);
-    fields.name_is_complete = 1;
-
-    /* Set the service UUID (128-bit) */
-    uint8_t uuid128[16] = {BLE_NAMEBADGE_SERVICE_UUID_128};
-    fields.uuids128 = (ble_uuid128_t[]){
-        BLE_UUID128_INIT(
-            uuid128[0], uuid128[1], uuid128[2], uuid128[3],
-            uuid128[4], uuid128[5], uuid128[6], uuid128[7],
-            uuid128[8], uuid128[9], uuid128[10], uuid128[11],
-            uuid128[12], uuid128[13], uuid128[14], uuid128[15]
-        )
-    };
-    fields.num_uuids128 = 1;
-    fields.uuids128_is_complete = 1;
-
-    /* Set advertisement data */
     rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to set advertisement data, rc=%d", rc);
-        return rc;
-    }
-
-    /* Set up manufacturer data in scan response (more space for nickname) */
-    memset(&fields, 0, sizeof(fields));
-    
-    /* Create manufacturer data: [Company ID (2 bytes)] [Nickname (up to 29 bytes)] */
-    uint8_t mfg_data[31];  /* Max manufacturer data size */
-    mfg_data[0] = BLE_NAMEBADGE_MANUFACTURER_ID & 0xFF;         /* Company ID low byte */
-    mfg_data[1] = (BLE_NAMEBADGE_MANUFACTURER_ID >> 8) & 0xFF;  /* Company ID high byte */
-    
-    /* Copy nickname after company ID */
-    size_t nickname_len = strlen(adv_nickname);
-    if (nickname_len > 29) {
-        nickname_len = 29;  /* Leave room for company ID */
-    }
-    memcpy(&mfg_data[2], adv_nickname, nickname_len);
-    
-    fields.mfg_data = mfg_data;
-    fields.mfg_data_len = 2 + nickname_len;
-
-    /* Set scan response data */
-    rc = ble_gap_adv_rsp_set_fields(&fields);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Failed to set scan response data, rc=%d", rc);
         return rc;
     }
 
@@ -286,4 +255,35 @@ esp_err_t ble_advertising_deinit(void)
 bool ble_advertising_is_active(void)
 {
     return is_advertising;
+}
+
+void ble_advertising_set_target(uint8_t b0, uint8_t b1)
+{
+    if (my_target[0] == b0 && my_target[1] == b1) {
+        return;  /* no change */
+    }
+    my_target[0] = b0;
+    my_target[1] = b1;
+    ESP_LOGI(TAG, "Meet target set to %02X:%02X", b0, b1);
+
+    /* Re-broadcast with the updated payload. */
+    if (is_advertising) {
+        int rc = ble_gap_adv_stop();
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            ESP_LOGW(TAG, "adv_stop while updating target rc=%d", rc);
+        }
+        is_advertising = false;
+    }
+    if (ble_hs_synced()) {
+        int rc = ble_advertise();
+        if (rc != 0) {
+            ESP_LOGE(TAG, "Failed to restart adv after target change, rc=%d", rc);
+        }
+    }
+}
+
+void ble_advertising_get_target(uint8_t out[2])
+{
+    out[0] = my_target[0];
+    out[1] = my_target[1];
 }

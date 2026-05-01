@@ -24,11 +24,27 @@
     0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80, \
     0x00, 0x10, 0x00, 0x00, 0x0F, 0x18, 0x00, 0x00
 
-/* Manufacturer ID for custom manufacturer data (use unassigned range) */
+/* Manufacturer ID (unassigned IEEE range) */
 #define BLE_NAMEBADGE_MANUFACTURER_ID   0xFFFF
 
-/* Maximum nickname length in BLE advertisement */
-#define BLE_ADV_MAX_NICKNAME_LEN        31
+/* 4-byte magic prefix that follows the company ID inside manufacturer data,
+ * so we can distinguish our beacons from other devices that also use 0xFFFF. */
+#define BLE_NAMEBADGE_MAGIC             "BADG"
+#define BLE_NAMEBADGE_MAGIC_LEN         4
+
+/* Two-byte "meet target" field that follows the magic. Holds the last two
+ * bytes of the BD address of the badge we want to meet (0,0 = no request). */
+#define BLE_NAMEBADGE_TARGET_LEN        2
+
+/* Header inside manufacturer data: company ID + magic + target. */
+#define BLE_NAMEBADGE_MFG_HDR_LEN       (2 + BLE_NAMEBADGE_MAGIC_LEN + BLE_NAMEBADGE_TARGET_LEN)
+
+/* Maximum nickname length the advertising payload can carry.
+ * Legacy adv PDU = 31 bytes total. We use:
+ *   3 bytes for Flags (T+L+V), and
+ *   (2 bytes T+L) + BLE_NAMEBADGE_MFG_HDR_LEN + nickname for mfg data.
+ * → 31 - 3 - 2 - 8 = 18 bytes available for the nickname. */
+#define BLE_ADV_MAX_NICKNAME_LEN        18
 
 /**
  * @brief Initialize BLE advertising
@@ -80,9 +96,27 @@ esp_err_t ble_advertising_deinit(void);
 
 /**
  * @brief Check if BLE advertising is currently active
- * 
+ *
  * @return true if advertising is active, false otherwise
  */
 bool ble_advertising_is_active(void);
+
+/**
+ * @brief Set the "meet request" target broadcast in our advertisement.
+ *
+ * Restarts advertising so the new target appears in the next adv interval.
+ * Pass (0, 0) to clear an outstanding request.
+ *
+ * @param b0 first target byte (esp_read_mac order; mac[4])
+ * @param b1 second target byte (mac[5])
+ */
+void ble_advertising_set_target(uint8_t b0, uint8_t b1);
+
+/**
+ * @brief Read the current outgoing meet target.
+ *
+ * @param out two-byte output (mac[4], mac[5]); set to {0,0} when no request.
+ */
+void ble_advertising_get_target(uint8_t out[2]);
 
 #endif /* BLE_ADVERTISING_H */

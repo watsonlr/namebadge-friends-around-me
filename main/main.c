@@ -20,6 +20,7 @@
 #include "freertos/event_groups.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_mac.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_partition.h"
@@ -35,27 +36,6 @@ static const char *TAG = "FRIENDS_APP";
 #define WIFI_CONFIG_NVS_PARTITION  "user_data"
 #define WIFI_CONFIG_NVS_NAMESPACE  "badge_cfg"
 #define WIFI_CONFIG_NVS_KEY_NICK   "nick"
-
-/**
- * @brief Check if badge has been configured with a nickname via bootloader
- * @return true if configured, false otherwise
- */
-static bool is_badge_configured(void)
-{
-    nvs_handle_t h;
-    if (nvs_open_from_partition(WIFI_CONFIG_NVS_PARTITION,
-                                WIFI_CONFIG_NVS_NAMESPACE,
-                                NVS_READONLY, &h) != ESP_OK) {
-        return false;
-    }
-    
-    char nick[33] = {0};
-    size_t len = sizeof(nick);
-    esp_err_t err = nvs_get_str(h, WIFI_CONFIG_NVS_KEY_NICK, nick, &len);
-    nvs_close(h);
-    
-    return (err == ESP_OK && nick[0] != '\0');
-}
 
 /**
  * @brief Get the configured badge nickname
@@ -84,35 +64,6 @@ static esp_err_t get_badge_nickname(char *out, size_t outlen)
     nvs_close(h);
     
     return err;
-}
-
-/**
- * @brief Display error message and hang
- * Used when badge is not configured
- */
-static void display_config_error(void)
-{
-    ESP_LOGE(TAG, "===========================================");
-    ESP_LOGE(TAG, "        BADGE NOT CONFIGURED!");
-    ESP_LOGE(TAG, "===========================================");
-    ESP_LOGE(TAG, "");
-    ESP_LOGE(TAG, "This app requires configuration via the");
-    ESP_LOGE(TAG, "BYUI eBadge bootloader.");
-    ESP_LOGE(TAG, "");
-    ESP_LOGE(TAG, "To configure:");
-    ESP_LOGE(TAG, "  1. Press RESET button");
-    ESP_LOGE(TAG, "  2. Within 500ms, press and hold BOOT");
-    ESP_LOGE(TAG, "  3. Follow bootloader setup wizard");
-    ESP_LOGE(TAG, "  4. Enter your nickname");
-    ESP_LOGE(TAG, "");
-    ESP_LOGE(TAG, "===========================================");
-    
-    // TODO: Display on screen when display component is ready
-    
-    // Hang here - user must enter bootloader
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
 }
 
 /**
@@ -232,19 +183,17 @@ static void on_button_event(button_event_t event)
         break;
         
     case BUTTON_RIGHT:
-        /* Check off selected friend as met */
+        /* Send a meet request to the selected friend.
+         * The handshake completes (both → met) only when the other side
+         * also presses Right and we see their adv targeting us. */
         {
-            char nickname[33];
-            if (ui_get_selected_nickname(nickname, sizeof(nickname)) == ESP_OK) {
-                ESP_LOGI(TAG, "Button RIGHT clicked - marking %s as met", nickname);
-                
-                /* Mark as met in BLE scanning */
-                ble_scanning_mark_as_met(nickname);
-                
-                /* Save to persistent storage */
-                met_tracker_add(nickname);
-                
-                /* Force UI refresh */
+            uint8_t addr[6];
+            if (ui_get_selected_addr(addr) == ESP_OK) {
+                /* addr is NimBLE-order (LSB first); the wire target uses
+                 * esp_read_mac order, so swap the last two bytes. */
+                ble_advertising_set_target(addr[1], addr[0]);
+                ESP_LOGI(TAG, "Button RIGHT - meet request → %02X:%02X",
+                         addr[1], addr[0]);
                 ui_force_redraw();
             } else {
                 ESP_LOGI(TAG, "Button RIGHT clicked - no friend selected");
@@ -284,21 +233,18 @@ void app_main(void)
     
     // Initialize NVS
     ESP_ERROR_CHECK(init_nvs());
-    
-    // Check if badge is configured
-    if (!is_badge_configured()) {
-        display_config_error();
-        // Never returns
-    }
-    
-    // Get nickname
+
+    // Get nickname (or fall back to a default if badge isn't configured)
     char nickname[33] = {0};
     esp_err_t err = get_badge_nickname(nickname, sizeof(nickname));
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read nickname: %s", esp_err_to_name(err));
-        display_config_error();
+    if (err != ESP_OK || nickname[0] == '\0') {
+        ESP_LOGW(TAG, "Badge not configured (%s) - using MAC-based nickname",
+                 err == ESP_OK ? "empty nick" : esp_err_to_name(err));
+        uint8_t mac[6] = {0};
+        esp_read_mac(mac, ESP_MAC_BT);
+        snprintf(nickname, sizeof(nickname), "badge-%02X%02X", mac[4], mac[5]);
     }
-    
+
     ESP_LOGI(TAG, "Badge nickname: %s", nickname);
     
     // Initialize met people tracking

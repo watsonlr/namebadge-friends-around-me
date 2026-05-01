@@ -13,14 +13,14 @@
 
 static const char *TAG = "BUTTONS";
 
-/* Button GPIO pins (from HARDWARE.md) */
+/* Button GPIO pins — BYUI eBadge V4.0 */
 static const uint8_t button_pins[BUTTON_COUNT] = {
-    17,  /* UP */
-    16,  /* DOWN */
-    14,  /* LEFT */
-    15,  /* RIGHT */
-    38,  /* A */
-    18   /* B */
+    11,  /* UP */
+    47,  /* DOWN */
+    21,  /* LEFT */
+    10,  /* RIGHT */
+    34,  /* A */
+    33   /* B */
 };
 
 static const char *button_names[BUTTON_COUNT] = {
@@ -165,16 +165,18 @@ esp_err_t buttons_init(void)
         .intr_type = GPIO_INTR_ANYEDGE  /* Trigger on both edges */
     };
     
+    /* Install GPIO ISR service before adding handlers (must be in this order). */
+    esp_err_t isr_err = gpio_install_isr_service(0);
+    if (isr_err != ESP_OK && isr_err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "gpio_install_isr_service failed: %s", esp_err_to_name(isr_err));
+        return isr_err;
+    }
+
     for (int i = 0; i < BUTTON_COUNT; i++) {
         io_conf.pin_bit_mask = (1ULL << button_pins[i]);
         gpio_config(&io_conf);
-        
-        /* Attach ISR handler */
         gpio_isr_handler_add(button_pins[i], button_isr_handler, (void*)i);
     }
-    
-    /* Install GPIO ISR service */
-    gpio_install_isr_service(0);
     
     /* Create button processing task */
     xTaskCreate(button_task, "buttons", 3072, NULL, 10, NULL);

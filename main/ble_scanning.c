@@ -10,6 +10,7 @@
 #include "met_tracker.h"
 #include <string.h>
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "host/ble_hs.h"
@@ -28,8 +29,12 @@ static ble_scan_update_cb_t update_callback = NULL;
 #define BLE_SCAN_INTERVAL_MS 100  /* How often to scan (100 ms) */
 #define BLE_SCAN_WINDOW_MS   50   /* How long each scan lasts (50 ms) */
 
-/* Custom service UUID for namebadge (must match advertising) */
-static const uint8_t namebadge_uuid128[16] = {BLE_NAMEBADGE_SERVICE_UUID_128};
+/* Magic prefix that follows the company ID inside our mfg data. */
+static const char namebadge_magic[BLE_NAMEBADGE_MAGIC_LEN] = BLE_NAMEBADGE_MAGIC;
+
+/* Last two bytes of our own BD address (esp_read_mac order: mac[4], mac[5]).
+ * Cached at scanning init so we can detect adverts that target us. */
+static uint8_t my_mac_tail[2] = {0, 0};
 
 /**
  * @brief Compare two BLE addresses
@@ -70,60 +75,37 @@ static int find_empty_slot(void)
 }
 
 /**
- * @brief Extract nickname from advertisement data
- * 
- * Looks for the nickname in:
- * 1. Complete Local Name field
- * 2. Manufacturer data (after 2-byte company ID)
- * 
- * @param fields Advertisement fields
- * @param nickname Output buffer for nickname
- * @param max_len Maximum nickname length
- * @return true if nickname found, false otherwise
+ * @brief Check if mfg data is one of our beacons (company ID + magic prefix).
  */
-static bool extract_nickname(const struct ble_hs_adv_fields *fields, char *nickname, size_t max_len)
+static bool is_namebadge_mfg(const struct ble_hs_adv_fields *fields)
 {
-    /* Try Complete Local Name first */
-    if (fields->name != NULL && fields->name_len > 0) {
-        size_t len = fields->name_len < max_len ? fields->name_len : max_len - 1;
-        memcpy(nickname, fields->name, len);
-        nickname[len] = '\0';
-        return true;
+    if (fields->mfg_data == NULL ||
+        fields->mfg_data_len < BLE_NAMEBADGE_MFG_HDR_LEN) {
+        return false;
     }
-    
-    /* Try manufacturer data (skip 2-byte company ID) */
-    if (fields->mfg_data != NULL && fields->mfg_data_len > 2) {
-        /* Check if it's our manufacturer ID */
-        uint16_t company_id = fields->mfg_data[0] | (fields->mfg_data[1] << 8);
-        if (company_id == BLE_NAMEBADGE_MANUFACTURER_ID) {
-            size_t len = fields->mfg_data_len - 2;
-            if (len > max_len - 1) {
-                len = max_len - 1;
-            }
-            memcpy(nickname, &fields->mfg_data[2], len);
-            nickname[len] = '\0';
-            return true;
-        }
+    uint16_t company_id = fields->mfg_data[0] | (fields->mfg_data[1] << 8);
+    if (company_id != BLE_NAMEBADGE_MANUFACTURER_ID) {
+        return false;
     }
-    
-    return false;
+    return memcmp(&fields->mfg_data[2], namebadge_magic, BLE_NAMEBADGE_MAGIC_LEN) == 0;
 }
 
 /**
- * @brief Check if advertisement contains our namebadge service UUID
+ * @brief Extract nickname from our mfg data (bytes after company ID + magic).
  */
-static bool has_namebadge_service(const struct ble_hs_adv_fields *fields)
+static bool extract_nickname(const struct ble_hs_adv_fields *fields, char *nickname, size_t max_len)
 {
-    /* Check 128-bit UUIDs */
-    if (fields->uuids128 != NULL && fields->num_uuids128 > 0) {
-        for (int i = 0; i < fields->num_uuids128; i++) {
-            if (memcmp(fields->uuids128[i].value, namebadge_uuid128, 16) == 0) {
-                return true;
-            }
-        }
+    size_t nick_off = BLE_NAMEBADGE_MFG_HDR_LEN;
+    if (fields->mfg_data_len <= nick_off) {
+        return false;
     }
-    
-    return false;
+    size_t len = fields->mfg_data_len - nick_off;
+    if (len > max_len - 1) {
+        len = max_len - 1;
+    }
+    memcpy(nickname, &fields->mfg_data[nick_off], len);
+    nickname[len] = '\0';
+    return true;
 }
 
 /**
@@ -143,7 +125,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
         }
 
         /* Check if this is a namebadge advertisement */
-        if (!has_namebadge_service(&fields)) {
+        if (!is_namebadge_mfg(&fields)) {
             return 0;
         }
 
@@ -154,36 +136,57 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
             return 0;
         }
 
+        /* Decode the meet target carried in their adv. Layout in mfg_data:
+         *   [company:2][magic:4][target:2][nickname...]
+         * target == my_mac_tail → they're requesting a meet with us. */
+        const uint8_t *their_target = &fields.mfg_data[2 + BLE_NAMEBADGE_MAGIC_LEN];
+        bool they_request_me = (their_target[0] == my_mac_tail[0] &&
+                                their_target[1] == my_mac_tail[1] &&
+                                (my_mac_tail[0] || my_mac_tail[1]));
+
+        /* Are we currently targeting this advertiser?
+         * NimBLE stores BD addresses LSB-first in addr.val[], so the bytes
+         * that match mac[4] and mac[5] from esp_read_mac are val[1] and val[0]. */
+        uint8_t my_outgoing[2];
+        ble_advertising_get_target(my_outgoing);
+        bool i_target_them = (my_outgoing[0] == event->disc.addr.val[1] &&
+                              my_outgoing[1] == event->disc.addr.val[0] &&
+                              (my_outgoing[0] || my_outgoing[1]));
+
         /* Update or add to nearby friends list */
         if (xSemaphoreTake(friends_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             int idx = find_friend_by_addr(event->disc.addr.val);
-            bool is_new = false;
-            
+            bool list_changed = false;
+
             if (idx >= 0) {
-                /* Update existing entry */
+                /* Update existing entry — RSSI/last_seen don't trigger redraw. */
                 nearby_friends[idx].rssi = event->disc.rssi;
                 nearby_friends[idx].last_seen = esp_timer_get_time();
-                
-                /* Update nickname if changed */
+
                 if (strcmp(nearby_friends[idx].nickname, nickname) != 0) {
                     strncpy(nearby_friends[idx].nickname, nickname, MAX_NICKNAME_LEN);
                     nearby_friends[idx].nickname[MAX_NICKNAME_LEN] = '\0';
                     ESP_LOGI(TAG, "Updated nickname: %s (RSSI: %d)", nickname, event->disc.rssi);
+                    list_changed = true;
+                }
+
+                if (nearby_friends[idx].they_request_me != they_request_me) {
+                    nearby_friends[idx].they_request_me = they_request_me;
+                    list_changed = true;
                 }
             } else {
-                /* Add new entry */
                 idx = find_empty_slot();
                 if (idx >= 0) {
                     nearby_friends[idx].is_active = true;
                     nearby_friends[idx].rssi = event->disc.rssi;
                     nearby_friends[idx].last_seen = esp_timer_get_time();
-                    /* Check if already met */
                     nearby_friends[idx].is_met = met_tracker_is_met(nickname);
+                    nearby_friends[idx].they_request_me = they_request_me;
                     memcpy(nearby_friends[idx].addr, event->disc.addr.val, 6);
                     strncpy(nearby_friends[idx].nickname, nickname, MAX_NICKNAME_LEN);
                     nearby_friends[idx].nickname[MAX_NICKNAME_LEN] = '\0';
-                    is_new = true;
-                    
+                    list_changed = true;
+
                     if (nearby_friends[idx].is_met) {
                         ESP_LOGI(TAG, "Found friend (already met): %s (RSSI: %d)", nickname, event->disc.rssi);
                     } else {
@@ -193,11 +196,23 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
                     ESP_LOGW(TAG, "Nearby friends list full, ignoring: %s", nickname);
                 }
             }
-            
+
+            /* Bilateral handshake → both have agreed to meet. Mark met,
+             * persist, and clear my outgoing target so we stop nagging them. */
+            if (idx >= 0 && i_target_them && they_request_me &&
+                !nearby_friends[idx].is_met) {
+                ESP_LOGI(TAG, "Mutual meet with %s — marked as met", nickname);
+                met_tracker_add(nickname);
+                nearby_friends[idx].is_met = true;
+                nearby_friends[idx].they_request_me = false;
+                ble_advertising_set_target(0, 0);
+                list_changed = true;
+            }
+
             xSemaphoreGive(friends_mutex);
-            
-            /* Notify callback of update */
-            if (update_callback != NULL && (is_new || idx >= 0)) {
+
+            /* Only notify when the displayed list actually changed. */
+            if (list_changed && update_callback != NULL) {
                 update_callback();
             }
         }
@@ -247,6 +262,14 @@ static int start_scan(void)
 esp_err_t ble_scanning_init(void)
 {
     ESP_LOGI(TAG, "Initializing BLE scanning...");
+
+    /* Cache the last two bytes of our BD address so per-event compares
+     * against the meet-target field can be done without re-querying. */
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_BT);
+    my_mac_tail[0] = mac[4];
+    my_mac_tail[1] = mac[5];
+    ESP_LOGI(TAG, "My MAC tail: %02X:%02X", my_mac_tail[0], my_mac_tail[1]);
 
     /* Create mutex for friends list */
     if (friends_mutex == NULL) {

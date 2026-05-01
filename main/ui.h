@@ -56,6 +56,14 @@ void ui_select_down(void);
 esp_err_t ui_get_selected_nickname(char *nickname, size_t max_len);
 
 /**
+ * @brief Get the BD address of the currently selected friend.
+ *
+ * @param out 6-byte buffer for the address (NimBLE order: out[0]=LSB).
+ * @return ESP_OK on success, ESP_ERR_NOT_FOUND if no selection.
+ */
+esp_err_t ui_get_selected_addr(uint8_t out[6]);
+
+/**
  * @brief Get the current selection index
  * 
  * @return Selected index (0-based), or -1 if no selection

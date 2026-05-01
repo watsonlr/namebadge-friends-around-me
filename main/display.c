@@ -2,11 +2,12 @@
  * @file display.c
  * @brief ILI9341 TFT driver — SPI2, landscape 320×240.
  *
- * Direct port of the BYUI-Namebadge4-OTA bootloader display driver.
- * Only the pin assignments differ (V3.0 hardware vs V4.0).
+ * Pin assignments (BYUI eBadge V4.0):
+ *   CS=0  DC=45  RST=1  CLK=46  MOSI=3  (write-only, no MISO)
  *
- * Pin assignments (BYUI eBadge V3.0 per HARDWARE.md):
- *   CS=9  DC=13  RST=48  CLK=12  MOSI=11  (write-only, no MISO)
+ * NOTE: CS shares GPIO 0 with the BOOT button. RST must be asserted LOW
+ * before spi_bus_add_device() so any CS glitches during pin reconfig are
+ * ignored by the panel (which is held in hardware reset).
  */
 
 #include "display.h"
@@ -17,13 +18,13 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 
-/* ── Pin definitions (V3.0 hardware) ────────────────────────────── */
-#define DISP_PIN_CS    9
-#define DISP_PIN_DC    13
-#define DISP_PIN_RST   48
-#define DISP_PIN_CLK   12
-#define DISP_PIN_MOSI  11
-#define DISP_PIN_MISO  10   /* GPIO10 — needed for display ID reads */
+/* ── Pin definitions (V4.0 hardware) ────────────────────────────── */
+#define DISP_PIN_CS    0
+#define DISP_PIN_DC    45
+#define DISP_PIN_RST   1
+#define DISP_PIN_CLK   46
+#define DISP_PIN_MOSI  3
+#define DISP_PIN_MISO  -1   /* write-only — no MISO on this display */
 #define DISP_SPI_HOST  SPI2_HOST
 #define DISP_SPI_FREQ  SPI_MASTER_FREQ_40M
 
@@ -161,23 +162,17 @@ static void disp_data(const uint8_t *data, int len)
     ESP_ERROR_CHECK(spi_device_polling_transmit(s_spi, &t));
 }
 
-/* Set address window. Panel is physically 240 cols × 320 rows.
- * In landscape with MADCTL MX=1:
- *   col axis  = vertical   (col 239=top, col 0=bottom)  → pc = (DISPLAY_HEIGHT-1) - y
- *   row axis  = horizontal (row 0=right, row 319=left)  → pr = (DISPLAY_WIDTH-1) - x
- * Callers must send pixel data in REVERSED x order so pixel[0] lands at pr0. */
+/* Set address window. MADCTL=0x60 (MV=1) swaps row/col axes, so CASET
+ * drives the y-axis and RASET drives the x-axis directly — no transform
+ * needed and pixel data is sent in normal left-to-right order. */
 static void set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 {
     uint8_t d[4];
-    uint16_t pc0 = (DISPLAY_HEIGHT - 1) - y1;
-    uint16_t pc1 = (DISPLAY_HEIGHT - 1) - y0;
-    uint16_t pr0 = (DISPLAY_WIDTH  - 1) - x1;
-    uint16_t pr1 = (DISPLAY_WIDTH  - 1) - x0;
-    disp_cmd(0x2A);
-    d[0]=pc0>>8; d[1]=pc0&0xFF; d[2]=pc1>>8; d[3]=pc1&0xFF;
+    disp_cmd(0x2A);   /* CASET — y */
+    d[0]=y0>>8; d[1]=y0&0xFF; d[2]=y1>>8; d[3]=y1&0xFF;
     disp_data(d, 4);
-    disp_cmd(0x2B);
-    d[0]=pr0>>8; d[1]=pr0&0xFF; d[2]=pr1>>8; d[3]=pr1&0xFF;
+    disp_cmd(0x2B);   /* RASET — x */
+    d[0]=x0>>8; d[1]=x0&0xFF; d[2]=x1>>8; d[3]=x1&0xFF;
     disp_data(d, 4);
     disp_cmd(0x2C);
 }
@@ -198,28 +193,9 @@ static inline void pack_pixel(uint8_t *dst, uint16_t color)
     dst[1] = (uint8_t)(color & 0xFF);
 }
 
-static void reverse_pixels(uint8_t *buf, int npixels)
-{
-    int lo = 0, hi = (npixels - 1) * 2;
-    while (lo < hi) {
-        uint8_t t0 = buf[lo], t1 = buf[lo + 1];
-        buf[lo] = buf[hi]; buf[lo + 1] = buf[hi + 1];
-        buf[hi] = t0;      buf[hi + 1] = t1;
-        lo += 2; hi -= 2;
-    }
-}
-
 /* ═══════════════════════════════════════════════════════════════════
  * ILI9341 initialisation (identical to BYUI-Namebadge4-OTA)
  * ═══════════════════════════════════════════════════════════════════ */
-
-static void ili9341_hw_reset(void)
-{
-    gpio_set_level(DISP_PIN_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    gpio_set_level(DISP_PIN_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(120));
-}
 
 static void ili9341_init_regs(void)
 {
@@ -247,50 +223,22 @@ static void ili9341_init_regs(void)
                                            0x31,0xC1,0x48,0x08,0x0F,0x0C,
                                            0x31,0x36,0x0F}, 15);
     disp_cmd(0x11); vTaskDelay(pdMS_TO_TICKS(120)); /* sleep out */
-    disp_cmd(0x36); disp_data((uint8_t[]){0x40}, 1);   /* MADCTL: MX=1 */
+    disp_cmd(0x36); disp_data((uint8_t[]){0x60}, 1);   /* MADCTL: MX=1, MV=1 — landscape */
     disp_cmd(0x21);                                     /* inversion on */
     disp_cmd(0x29);                                     /* display on */
 }
 
-/* Read a display register (ILI9341 4-wire SPI half-duplex read).
- * Sends cmd+dummy_bytes on MOSI while capturing MISO simultaneously.
- * Returns up to 4 data bytes packed into a uint32_t (byte[0] = MSB). */
-static uint32_t read_reg(uint8_t cmd, int nbytes)
-{
-    /* Full-duplex: tx cmd + (nbytes+1) zeros, rx same length.
-     * MISO byte[0] is received during the CMD byte (garbage).
-     * MISO bytes[1..nbytes] are the actual register values. */
-    int total = 1 + nbytes;
-    uint8_t tx[5] = {cmd, 0, 0, 0, 0};
-    uint8_t rx[5] = {0};
-    spi_transaction_t t = {
-        .length    = (size_t)total * 8,
-        .rxlength  = (size_t)total * 8,
-        .tx_buffer = tx,
-        .rx_buffer = rx,
-        .user      = (void *)0,  /* DC=0 during cmd byte */
-    };
-    esp_err_t err = spi_device_polling_transmit(s_spi, &t);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "read_reg(0x%02X) SPI error: %s", cmd, esp_err_to_name(err));
-        return 0xFFFFFFFF;
-    }
-    uint32_t val = 0;
-    for (int i = 1; i <= nbytes; i++) val = (val << 8) | rx[i];
-    return val;
-}
-
 static void spi_and_gpio_init(void)
 {
+    /* RST is already configured and driven LOW by display_init() before this
+     * call — do not touch it here. Pre-load DC then enable drive. */
+    gpio_set_level(DISP_PIN_DC, 0);
+
     gpio_config_t io = {
-        .pin_bit_mask = (1ULL << DISP_PIN_DC) | (1ULL << DISP_PIN_RST),
+        .pin_bit_mask = (1ULL << DISP_PIN_DC),
         .mode         = GPIO_MODE_OUTPUT,
     };
     ESP_ERROR_CHECK(gpio_config(&io));
-
-    /* Deselect SD card CS (GPIO3, shared SPI bus) */
-    gpio_set_direction(3, GPIO_MODE_OUTPUT);
-    gpio_set_level(3, 1);
 
     spi_bus_config_t bus = {
         .mosi_io_num     = DISP_PIN_MOSI,
@@ -319,31 +267,24 @@ static void spi_and_gpio_init(void)
 esp_err_t display_init(void)
 {
     ESP_LOGI(TAG, "Initialising SPI2 and ILI9341 (landscape 320x240)");
+
+    /* Assert RST LOW before SPI init. CS shares GPIO 0 with the BOOT button;
+     * spi_bus_add_device() may glitch CS while reconfiguring the pin, but the
+     * panel ignores all SPI activity while held in hardware reset. */
+    gpio_set_level(DISP_PIN_RST, 0);
+    gpio_config_t rst_cfg = {
+        .pin_bit_mask = (1ULL << DISP_PIN_RST),
+        .mode         = GPIO_MODE_OUTPUT,
+    };
+    ESP_ERROR_CHECK(gpio_config(&rst_cfg));
+
     spi_and_gpio_init();
-    ili9341_hw_reset();
+
+    vTaskDelay(pdMS_TO_TICKS(10));   /* RST low hold: ILI9341 min is 10 µs */
+    gpio_set_level(DISP_PIN_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(150));  /* post-reset stabilisation */
+
     ili9341_init_regs();
-
-    /* Read display ID — ILI9341 should return 0x009341; ST7789 returns 0x008552 */
-    uint32_t id = read_reg(0x04, 3);
-    ESP_LOGI(TAG, "Display RDDID = 0x%06lX (ILI9341=0x009341, ST7789=0x008552)", (unsigned long)id);
-
-    /* Read display power mode — bit4=sleep(0=awake), bit2=display_on */
-    uint32_t pm = read_reg(0x0A, 1);
-    ESP_LOGI(TAG, "Display power mode = 0x%02lX (expect 0x9C: awake+display_on)", (unsigned long)pm);
-
-    /* Diagnostic fill cycle: white → red → green → black.
-     * If the backlight is on and the panel works, each fill is unmissable.
-     * If NOTHING appears during this 3-second window, the backlight is off
-     * or SPI signals are not reaching the display panel. */
-    ESP_LOGI(TAG, "DIAG: filling white ...");
-    display_fill(0xFFFF);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_LOGI(TAG, "DIAG: filling red ...");
-    display_fill(0xF800);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_LOGI(TAG, "DIAG: filling green ...");
-    display_fill(0x07E0);
-    vTaskDelay(pdMS_TO_TICKS(1000));
     display_fill(0x0000);
 
     ESP_LOGI(TAG, "Display ready");
@@ -405,7 +346,6 @@ void display_draw_char(int16_t x, int16_t y, char c, uint16_t color, uint16_t bg
             if (screen_x1 >= DISPLAY_WIDTH) screen_x1 = DISPLAY_WIDTH - 1;
             set_window((uint16_t)x, (uint16_t)screen_y,
                        (uint16_t)screen_x1, (uint16_t)screen_y);
-            reverse_pixels(row_buf, row_bytes / 2);
             write_pixels(row_buf, row_bytes);
         }
     }

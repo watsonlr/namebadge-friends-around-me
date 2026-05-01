@@ -13,9 +13,9 @@ CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
 
-# PSRAM (ignore not found - known issue with rev 0.2)
+# PSRAM (Quad mode - typical for WROOM-1-N8R2/N8R8)
 CONFIG_SPIRAM=y
-CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_IGNORE_NOTFOUND=y
 
@@ -30,8 +30,9 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=0
 # Disable classic Bluetooth
 CONFIG_BT_CLASSIC_ENABLED=n
 
-# Increase BLE advertising data size
-CONFIG_BT_NIMBLE_EXT_ADV=y
+# Use legacy advertising (31-byte payload). Ext_adv would force the
+# ble_gap_ext_adv_* APIs and break ble_gap_adv_set_fields/start with ENOTSUP.
+# CONFIG_BT_NIMBLE_EXT_ADV is not set
 
 # NVS
 CONFIG_NVS_ENCRYPTION=n
