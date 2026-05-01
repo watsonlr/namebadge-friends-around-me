@@ -32,16 +32,25 @@ typedef struct {
     uint8_t addr[6];                      /**< BLE address (NimBLE order: addr[0]=LSB) */
     bool is_met;                          /**< True if already met (filtered from display) */
     bool is_active;                       /**< True if slot is in use */
-    bool they_request_me;                 /**< True if their adv targets my MAC */
+    bool they_request_me;                 /**< True if their adv targets my MAC w/ MEET kind */
+    bool they_find_me;                    /**< True if their adv targets my MAC w/ FIND kind */
 } nearby_friend_t;
 
 /**
  * @brief Callback function type for nearby friends list updates
- * 
+ *
  * Called whenever the nearby friends list changes (friend added, removed, or updated).
  * Use ble_scanning_get_nearby_friends() to retrieve the updated list.
  */
 typedef void (*ble_scan_update_cb_t)(void);
+
+/**
+ * @brief Callback fired the moment a bilateral meet handshake completes.
+ *
+ * Receives the freshly-met friend's nickname. Invoked from the BLE host
+ * task — keep handlers cheap (no SPI / display work).
+ */
+typedef void (*ble_scan_meet_cb_t)(const char *nickname);
 
 /**
  * @brief Initialize BLE scanning
@@ -130,6 +139,11 @@ bool ble_scanning_is_friend_nearby(const char *nickname);
  * @param callback Callback function (NULL to unregister)
  */
 void ble_scanning_register_update_callback(ble_scan_update_cb_t callback);
+
+/**
+ * @brief Register a callback invoked when a bilateral meet completes.
+ */
+void ble_scanning_register_meet_callback(ble_scan_meet_cb_t callback);
 
 /**
  * @brief Clear all nearby friends from the list

@@ -24,117 +24,10 @@ static char met_list[MAX_MET_PEOPLE][MET_TRACKER_MAX_NICKNAME_LEN + 1];
 static uint16_t met_count = 0;
 static SemaphoreHandle_t met_mutex = NULL;
 
-/**
- * @brief Load met list from NVS
- */
-static esp_err_t load_from_nvs(void)
-{
-    nvs_handle_t handle;
-    esp_err_t err;
-    
-    err = nvs_open_from_partition(NVS_PARTITION, NVS_NAMESPACE, NVS_READONLY, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open NVS for reading: %s", esp_err_to_name(err));
-        return err;
-    }
-    
-    /* Read count */
-    err = nvs_get_u16(handle, NVS_KEY_COUNT, &met_count);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        /* First run, no data yet */
-        met_count = 0;
-        nvs_close(handle);
-        ESP_LOGI(TAG, "No existing met list found (first run)");
-        return ESP_OK;
-    } else if (err != ESP_OK) {
-        nvs_close(handle);
-        ESP_LOGE(TAG, "Failed to read met count: %s", esp_err_to_name(err));
-        return err;
-    }
-    
-    /* Validate count */
-    if (met_count > MAX_MET_PEOPLE) {
-        ESP_LOGW(TAG, "Met count %u exceeds max, capping to %d", met_count, MAX_MET_PEOPLE);
-        met_count = MAX_MET_PEOPLE;
-    }
-    
-    /* Read list blob */
-    if (met_count > 0) {
-        size_t blob_size = met_count * (MET_TRACKER_MAX_NICKNAME_LEN + 1);
-        err = nvs_get_blob(handle, NVS_KEY_LIST, met_list, &blob_size);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to read met list: %s", esp_err_to_name(err));
-            met_count = 0;
-            nvs_close(handle);
-            return err;
-        }
-    }
-    
-    nvs_close(handle);
-    ESP_LOGI(TAG, "Loaded %u people from met list", met_count);
-    
-    /* Log the names */
-    for (uint16_t i = 0; i < met_count; i++) {
-        ESP_LOGI(TAG, "  - %s", met_list[i]);
-    }
-    
-    return ESP_OK;
-}
-
-/**
- * @brief Save met list to NVS
- */
-static esp_err_t save_to_nvs(void)
-{
-    nvs_handle_t handle;
-    esp_err_t err;
-    
-    err = nvs_open_from_partition(NVS_PARTITION, NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for writing: %s", esp_err_to_name(err));
-        return err;
-    }
-    
-    /* Write count */
-    err = nvs_set_u16(handle, NVS_KEY_COUNT, met_count);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to write met count: %s", esp_err_to_name(err));
-        nvs_close(handle);
-        return err;
-    }
-    
-    /* Write list blob */
-    if (met_count > 0) {
-        size_t blob_size = met_count * (MET_TRACKER_MAX_NICKNAME_LEN + 1);
-        err = nvs_set_blob(handle, NVS_KEY_LIST, met_list, blob_size);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to write met list: %s", esp_err_to_name(err));
-            nvs_close(handle);
-            return err;
-        }
-    } else {
-        /* Erase list if count is 0 */
-        nvs_erase_key(handle, NVS_KEY_LIST);
-    }
-    
-    /* Commit changes */
-    err = nvs_commit(handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to commit NVS: %s", esp_err_to_name(err));
-        nvs_close(handle);
-        return err;
-    }
-    
-    nvs_close(handle);
-    ESP_LOGI(TAG, "Saved %u people to met list", met_count);
-    return ESP_OK;
-}
-
 esp_err_t met_tracker_init(void)
 {
-    ESP_LOGI(TAG, "Initializing met tracker...");
-    
-    /* Create mutex */
+    ESP_LOGI(TAG, "Initializing met tracker (in-memory only)...");
+
     if (met_mutex == NULL) {
         met_mutex = xSemaphoreCreateMutex();
         if (met_mutex == NULL) {
@@ -142,17 +35,21 @@ esp_err_t met_tracker_init(void)
             return ESP_FAIL;
         }
     }
-    
-    /* Initialize list */
+
     memset(met_list, 0, sizeof(met_list));
     met_count = 0;
-    
-    /* Load from NVS */
-    esp_err_t err = load_from_nvs();
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW(TAG, "Failed to load from NVS, starting with empty list");
+
+    /* Wipe any met list that older builds may have left in NVS so the badge
+     * really does start empty on every reset. Best effort — failure is fine. */
+    nvs_handle_t handle;
+    if (nvs_open_from_partition(NVS_PARTITION, NVS_NAMESPACE,
+                                NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_erase_key(handle, NVS_KEY_COUNT);
+        nvs_erase_key(handle, NVS_KEY_LIST);
+        nvs_commit(handle);
+        nvs_close(handle);
     }
-    
+
     ESP_LOGI(TAG, "Met tracker initialized with %u people", met_count);
     return ESP_OK;
 }
@@ -190,12 +87,9 @@ esp_err_t met_tracker_add(const char *nickname)
     met_count++;
     
     ESP_LOGI(TAG, "Added %s to met list (total: %u)", nickname, met_count);
-    
-    /* Save to NVS */
-    esp_err_t err = save_to_nvs();
-    
+
     xSemaphoreGive(met_mutex);
-    return err;
+    return ESP_OK;
 }
 
 bool met_tracker_is_met(const char *nickname)
@@ -282,12 +176,9 @@ esp_err_t met_tracker_remove(const char *nickname)
     met_count--;
     
     ESP_LOGI(TAG, "Removed %s from met list (total: %u)", nickname, met_count);
-    
-    /* Save to NVS */
-    esp_err_t err = save_to_nvs();
-    
+
     xSemaphoreGive(met_mutex);
-    return err;
+    return ESP_OK;
 }
 
 esp_err_t met_tracker_clear_all(void)
@@ -300,12 +191,9 @@ esp_err_t met_tracker_clear_all(void)
     met_count = 0;
     
     ESP_LOGI(TAG, "Cleared all met people");
-    
-    /* Save to NVS */
-    esp_err_t err = save_to_nvs();
-    
+
     xSemaphoreGive(met_mutex);
-    return err;
+    return ESP_OK;
 }
 
 void met_tracker_export(met_tracker_export_cb_t callback)

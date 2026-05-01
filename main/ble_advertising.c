@@ -8,6 +8,7 @@
 #include "ble_advertising.h"
 #include <string.h>
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -15,12 +16,17 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
+/* How long a FIND request keeps broadcasting before auto-clearing. */
+#define FIND_SEND_DURATION_US (5LL * 1000 * 1000)
+
 static const char *TAG = "BLE_ADV";
 
 /* Advertisement state */
 static bool is_advertising = false;
 static char adv_nickname[BLE_ADV_MAX_NICKNAME_LEN + 1] = {0};
+static uint8_t my_target_kind = BLE_TARGET_NONE;
 static uint8_t my_target[BLE_NAMEBADGE_TARGET_LEN] = {0, 0};
+static int64_t my_target_until_us = 0;  /* only set for FIND */
 
 /* NimBLE host task handle */
 static void ble_host_task(void *param);
@@ -80,13 +86,15 @@ static int ble_advertise(void)
     int rc;
 
     /* Build manufacturer data:
-     *   [company ID (2)][magic "BADG"(4)][meet target (2)][nickname]. */
+     *   [company ID (2)][magic "BADG"(4)][kind (1)][target (2)][nickname]. */
     uint8_t mfg_data[BLE_NAMEBADGE_MFG_HDR_LEN + BLE_ADV_MAX_NICKNAME_LEN];
     mfg_data[0] = BLE_NAMEBADGE_MANUFACTURER_ID & 0xFF;
     mfg_data[1] = (BLE_NAMEBADGE_MANUFACTURER_ID >> 8) & 0xFF;
     memcpy(&mfg_data[2], BLE_NAMEBADGE_MAGIC, BLE_NAMEBADGE_MAGIC_LEN);
-    mfg_data[2 + BLE_NAMEBADGE_MAGIC_LEN]     = my_target[0];
-    mfg_data[2 + BLE_NAMEBADGE_MAGIC_LEN + 1] = my_target[1];
+    size_t off = 2 + BLE_NAMEBADGE_MAGIC_LEN;
+    mfg_data[off++] = my_target_kind;
+    mfg_data[off++] = my_target[0];
+    mfg_data[off++] = my_target[1];
 
     size_t nickname_len = strlen(adv_nickname);
     if (nickname_len > BLE_ADV_MAX_NICKNAME_LEN) {
@@ -257,14 +265,22 @@ bool ble_advertising_is_active(void)
     return is_advertising;
 }
 
-void ble_advertising_set_target(uint8_t b0, uint8_t b1)
+void ble_advertising_set_target(uint8_t kind, uint8_t b0, uint8_t b1)
 {
-    if (my_target[0] == b0 && my_target[1] == b1) {
+    if (kind == BLE_TARGET_NONE) {
+        b0 = 0;
+        b1 = 0;
+    }
+    if (my_target_kind == kind && my_target[0] == b0 && my_target[1] == b1) {
         return;  /* no change */
     }
+    my_target_kind = kind;
     my_target[0] = b0;
     my_target[1] = b1;
-    ESP_LOGI(TAG, "Meet target set to %02X:%02X", b0, b1);
+    my_target_until_us = (kind == BLE_TARGET_FIND)
+        ? esp_timer_get_time() + FIND_SEND_DURATION_US
+        : 0;
+    ESP_LOGI(TAG, "Target kind=%d %02X:%02X", kind, b0, b1);
 
     /* Re-broadcast with the updated payload. */
     if (is_advertising) {
@@ -282,8 +298,19 @@ void ble_advertising_set_target(uint8_t b0, uint8_t b1)
     }
 }
 
-void ble_advertising_get_target(uint8_t out[2])
+void ble_advertising_get_target(uint8_t *kind, uint8_t out[2])
 {
+    if (kind) *kind = my_target_kind;
     out[0] = my_target[0];
     out[1] = my_target[1];
+}
+
+void ble_advertising_check_target_timeout(void)
+{
+    if (my_target_kind == BLE_TARGET_FIND &&
+        my_target_until_us > 0 &&
+        esp_timer_get_time() >= my_target_until_us) {
+        ESP_LOGI(TAG, "FIND request expired — clearing target");
+        ble_advertising_set_target(BLE_TARGET_NONE, 0, 0);
+    }
 }

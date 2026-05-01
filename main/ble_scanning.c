@@ -24,6 +24,7 @@ static nearby_friend_t nearby_friends[MAX_NEARBY_FRIENDS];
 static SemaphoreHandle_t friends_mutex = NULL;
 static bool is_scanning = false;
 static ble_scan_update_cb_t update_callback = NULL;
+static ble_scan_meet_cb_t   meet_callback   = NULL;
 
 /* Scan parameters */
 #define BLE_SCAN_INTERVAL_MS 100  /* How often to scan (100 ms) */
@@ -136,22 +137,26 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
             return 0;
         }
 
-        /* Decode the meet target carried in their adv. Layout in mfg_data:
-         *   [company:2][magic:4][target:2][nickname...]
-         * target == my_mac_tail → they're requesting a meet with us. */
-        const uint8_t *their_target = &fields.mfg_data[2 + BLE_NAMEBADGE_MAGIC_LEN];
-        bool they_request_me = (their_target[0] == my_mac_tail[0] &&
-                                their_target[1] == my_mac_tail[1] &&
-                                (my_mac_tail[0] || my_mac_tail[1]));
+        /* Decode the kind+target they're advertising. Layout in mfg_data:
+         *   [company:2][magic:4][kind:1][target:2][nickname...] */
+        uint8_t their_kind     = fields.mfg_data[2 + BLE_NAMEBADGE_MAGIC_LEN];
+        const uint8_t *their_target = &fields.mfg_data[2 + BLE_NAMEBADGE_MAGIC_LEN + 1];
+        bool target_is_me = (their_target[0] == my_mac_tail[0] &&
+                             their_target[1] == my_mac_tail[1] &&
+                             (my_mac_tail[0] || my_mac_tail[1]));
+        bool they_request_me = target_is_me && (their_kind == BLE_TARGET_MEET);
+        bool they_find_me    = target_is_me && (their_kind == BLE_TARGET_FIND);
 
-        /* Are we currently targeting this advertiser?
+        /* Are we currently MEET-targeting this advertiser?
          * NimBLE stores BD addresses LSB-first in addr.val[], so the bytes
          * that match mac[4] and mac[5] from esp_read_mac are val[1] and val[0]. */
+        uint8_t my_kind;
         uint8_t my_outgoing[2];
-        ble_advertising_get_target(my_outgoing);
-        bool i_target_them = (my_outgoing[0] == event->disc.addr.val[1] &&
-                              my_outgoing[1] == event->disc.addr.val[0] &&
-                              (my_outgoing[0] || my_outgoing[1]));
+        ble_advertising_get_target(&my_kind, my_outgoing);
+        bool i_meet_target_them = (my_kind == BLE_TARGET_MEET &&
+                                   my_outgoing[0] == event->disc.addr.val[1] &&
+                                   my_outgoing[1] == event->disc.addr.val[0] &&
+                                   (my_outgoing[0] || my_outgoing[1]));
 
         /* Update or add to nearby friends list */
         if (xSemaphoreTake(friends_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -174,6 +179,10 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
                     nearby_friends[idx].they_request_me = they_request_me;
                     list_changed = true;
                 }
+                if (nearby_friends[idx].they_find_me != they_find_me) {
+                    nearby_friends[idx].they_find_me = they_find_me;
+                    list_changed = true;
+                }
             } else {
                 idx = find_empty_slot();
                 if (idx >= 0) {
@@ -182,6 +191,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
                     nearby_friends[idx].last_seen = esp_timer_get_time();
                     nearby_friends[idx].is_met = met_tracker_is_met(nickname);
                     nearby_friends[idx].they_request_me = they_request_me;
+                    nearby_friends[idx].they_find_me = they_find_me;
                     memcpy(nearby_friends[idx].addr, event->disc.addr.val, 6);
                     strncpy(nearby_friends[idx].nickname, nickname, MAX_NICKNAME_LEN);
                     nearby_friends[idx].nickname[MAX_NICKNAME_LEN] = '\0';
@@ -199,14 +209,16 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
 
             /* Bilateral handshake → both have agreed to meet. Mark met,
              * persist, and clear my outgoing target so we stop nagging them. */
-            if (idx >= 0 && i_target_them && they_request_me &&
+            bool just_met = false;
+            if (idx >= 0 && i_meet_target_them && they_request_me &&
                 !nearby_friends[idx].is_met) {
                 ESP_LOGI(TAG, "Mutual meet with %s — marked as met", nickname);
                 met_tracker_add(nickname);
                 nearby_friends[idx].is_met = true;
                 nearby_friends[idx].they_request_me = false;
-                ble_advertising_set_target(0, 0);
+                ble_advertising_set_target(BLE_TARGET_NONE, 0, 0);
                 list_changed = true;
+                just_met = true;
             }
 
             xSemaphoreGive(friends_mutex);
@@ -214,6 +226,9 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
             /* Only notify when the displayed list actually changed. */
             if (list_changed && update_callback != NULL) {
                 update_callback();
+            }
+            if (just_met && meet_callback != NULL) {
+                meet_callback(nickname);
             }
         }
         
@@ -433,6 +448,12 @@ void ble_scanning_register_update_callback(ble_scan_update_cb_t callback)
 {
     update_callback = callback;
     ESP_LOGI(TAG, "Update callback %s", callback ? "registered" : "unregistered");
+}
+
+void ble_scanning_register_meet_callback(ble_scan_meet_cb_t callback)
+{
+    meet_callback = callback;
+    ESP_LOGI(TAG, "Meet callback %s", callback ? "registered" : "unregistered");
 }
 
 void ble_scanning_clear_all(void)

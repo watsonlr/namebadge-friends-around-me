@@ -5,5 +5,6 @@ idf_component_register(SRCS "main.c"
                             "ui.c"
                             "buttons.c"
                             "met_tracker.c"
+                            "leds.c"
                     INCLUDE_DIRS "."
-                    REQUIRES nvs_flash bt driver)
+                    REQUIRES nvs_flash bt driver esp_driver_rmt)
