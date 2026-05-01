@@ -9,7 +9,6 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 
 static const char *TAG = "BUTTONS";
 
@@ -32,7 +31,14 @@ typedef struct {
     bool is_pressed;
     uint32_t press_time_ms;
     bool long_press_sent;
+    uint32_t last_edge_ms;
 } button_state_t;
+
+typedef struct {
+    button_id_t button;
+    uint8_t level;
+    uint32_t timestamp_ms;
+} raw_button_event_t;
 
 static button_state_t button_states[BUTTON_COUNT];
 static QueueHandle_t button_event_queue = NULL;
@@ -48,9 +54,14 @@ static button_callback_t event_callback = NULL;
 static void IRAM_ATTR button_isr_handler(void *arg)
 {
     button_id_t button = (button_id_t)(int)arg;
-    
-    /* Send button ID to queue for processing in task */
-    xQueueSendFromISR(button_event_queue, &button, NULL);
+
+    raw_button_event_t evt;
+    evt.button = button;
+    evt.level = (uint8_t)gpio_get_level(button_pins[button]);
+    evt.timestamp_ms = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCountFromISR());
+
+    /* Queue edge + sampled level so the task can debounce deterministically. */
+    xQueueSendFromISR(button_event_queue, &evt, NULL);
 }
 
 /**
@@ -58,23 +69,29 @@ static void IRAM_ATTR button_isr_handler(void *arg)
  */
 static void button_task(void *param)
 {
-    button_id_t button;
+    raw_button_event_t raw_evt;
     button_event_t event;
     
     ESP_LOGI(TAG, "Button task started");
     
     while (1) {
-        if (xQueueReceive(button_event_queue, &button, pdMS_TO_TICKS(100))) {
-            /* Debounce delay */
-            vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_TIME_MS));
-            
-            /* Read current button state */
-            int level = gpio_get_level(button_pins[button]);
-            bool is_pressed = (level == 0);  /* Active LOW */
-            
-            uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-            
-            if (is_pressed && !button_states[button].is_pressed) {
+        if (xQueueReceive(button_event_queue, &raw_evt, pdMS_TO_TICKS(100))) {
+            button_id_t button = raw_evt.button;
+            bool is_pressed = (raw_evt.level == 0);  /* Active LOW */
+            uint32_t now_ms = raw_evt.timestamp_ms;
+
+            /* Debounce by time since the last accepted edge. */
+            if ((now_ms - button_states[button].last_edge_ms) < DEBOUNCE_TIME_MS) {
+                continue;
+            }
+            button_states[button].last_edge_ms = now_ms;
+
+            /* Ignore repeated same-level edges. */
+            if (is_pressed == button_states[button].is_pressed) {
+                continue;
+            }
+
+            if (is_pressed) {
                 /* Button pressed */
                 button_states[button].is_pressed = true;
                 button_states[button].press_time_ms = now_ms;
@@ -90,7 +107,7 @@ static void button_task(void *param)
                 
                 ESP_LOGI(TAG, "Button %s PRESSED", button_names[button]);
                 
-            } else if (!is_pressed && button_states[button].is_pressed) {
+            } else {
                 /* Button released */
                 uint32_t press_duration = now_ms - button_states[button].press_time_ms;
                 button_states[button].is_pressed = false;
@@ -117,7 +134,7 @@ static void button_task(void *param)
         }
         
         /* Check for long presses */
-        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        uint32_t now_ms = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount());
         for (int i = 0; i < BUTTON_COUNT; i++) {
             if (button_states[i].is_pressed && !button_states[i].long_press_sent) {
                 uint32_t press_duration = now_ms - button_states[i].press_time_ms;
@@ -148,10 +165,11 @@ esp_err_t buttons_init(void)
         button_states[i].is_pressed = false;
         button_states[i].press_time_ms = 0;
         button_states[i].long_press_sent = false;
+        button_states[i].last_edge_ms = 0;
     }
     
     /* Create event queue */
-    button_event_queue = xQueueCreate(10, sizeof(button_id_t));
+    button_event_queue = xQueueCreate(32, sizeof(raw_button_event_t));
     if (button_event_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create button event queue");
         return ESP_FAIL;

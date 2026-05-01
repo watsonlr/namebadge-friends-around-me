@@ -2,322 +2,104 @@
 
 ## Overview
 
-This is an **OTA application** for the BYUI eBadge bootloader platform. It enables namebadges to discover and display other nearby namebadges using Bluetooth Low Energy (BLE) advertising and scanning. The primary objective is to **facilitate meeting others** at events — users can see who's nearby and mark people as "met" once they've introduced themselves.
+Friends Around Me is an OTA app for the BYUI eBadge platform (ESP32-S3 + NimBLE).
+Each badge advertises its nickname and listens for other badges using the same
+manufacturer payload format. The app supports a bilateral meet handshake so both
+people intentionally confirm they met.
 
-**Application Type**: OTA-installable student application  
-**Bootloader Required**: BYUI-Namebadge-OTA (factory partition)  
-**Configuration**: Uses nickname configured via bootloader's captive portal
+## Current Behavior (Implemented)
 
-## Requirements
+1. Reads nickname from NVS partition user_data, namespace badge_cfg, key nick.
+2. Falls back to badge-XXYY (BT MAC tail) if nickname is missing.
+3. Advertises custom manufacturer data with:
+   - company id: 0xFFFF
+   - magic: BADG
+   - target kind: NONE, MEET, or FIND
+   - target bytes: 2-byte MAC tail target
+   - nickname payload: up to 17 bytes
+4. Scans continuously for matching manufacturer payloads.
+5. Tracks nearby entries with RSSI, timestamp, BLE address, and request flags.
+6. Removes stale nearby entries after 5 seconds without sightings.
+7. Uses Right button to send MEET request to currently selected friend.
+8. Marks friend as met only on bilateral MEET handshake:
+   - I am MEET-targeting them, and
+   - their advertisement is MEET-targeting me.
 
-### Core Functionality
+## Important Current Limitation
 
-1. **Personalization**: Each board is customized with a user's name
-2. **Name Broadcasting**: Advertise the user's name via BLE
-3. **Proximity Detection**: Scan for and display other nearby namebadges
-4. **Interactive Check-off**: Mark people as met so they're removed from the "around me" list
+Met-list persistence is currently disabled in practice:
 
-## Technical Approach
+- met_tracker_init initializes in-memory structures.
+- It also erases old met_count and met_list keys in user_data/friends_app.
+- Result: met state does not survive reboot right now.
 
-### BLE Advertising
+The nickname and bootloader-owned settings still persist normally.
 
-Each namebadge will:
-- Broadcast its name in BLE advertisement packets
-- Use a custom service UUID to identify namebadge devices
-- Include the user's name in the advertising data payload
+## BLE Payload Format
 
-### BLE Scanning
+Advertisement uses flags + manufacturer data only (legacy 31-byte payload budget).
 
-Each namebadge will:
-- Continuously scan for BLE advertisements from other namebadges
-- Filter advertisements by the custom namebadge service UUID
-- Parse received advertisements to extract names
-- Track RSSI (signal strength) to estimate proximity
-- Maintain a list of nearby friends
+Manufacturer payload layout:
 
-### Display
+- bytes 0-1: company id (0xFFFF)
+- bytes 2-5: ASCII magic BADG
+- byte 6: target kind
+- bytes 7-8: target MAC tail bytes
+- bytes 9+: nickname bytes
 
-The namebadge display will show:
-- User's own name (top/header)
-- List of detected nearby friends (not yet met)
-- Visual indicator for the currently selected person
-- Optional: signal strength indicator or distance estimate
-- Optional: count of total people met
+Because of payload limits, BLE_ADV_MAX_NICKNAME_LEN is 17.
 
-### User Interaction
+## Meet and Find Semantics
 
-**Meeting People Workflow:**
+- MEET means "I want to confirm meeting this person."
+- FIND means "help me find this person" and auto-expires after 5 seconds.
+- Current button mapping sends MEET requests from Right click.
+- FIND support exists in payload and scanning logic, and is visualized by UI/LED if seen.
 
-1. Display shows list of nearby people broadcasting their names
-2. User navigates the list with **Up/Down** buttons
-3. When user meets someone, they select that person's name and press **Right** button
-4. Selected person is marked as "met" and removed from the "Friends Around Me" list
-5. Met status persists in NVS storage
+## UI Behavior
 
-**Button Mapping:**
-- **Up** (GPIO 17): Move selection up in the list
-- **Down** (GPIO 16): Move selection down in the list  
-- **Right** (GPIO 15): Check off selected person as "met"
-- **Left** (GPIO 14): Optional - undo last check-off or view met list
-- **A** (GPIO 38): Optional - reset all met status
-- **B** (GPIO 18): Optional - toggle display modes
+- Header shows list mode and local nickname.
+- Two body modes:
+  - Friends to Meet
+  - Friends I Have Met
+- Rows can flash by state:
+  - red: my outgoing MEET target
+  - yellow: incoming MEET request toward me
+  - green: incoming FIND request toward me
+- Footer shows Seen and Met counters.
+- LED feedback blinks with incoming requests:
+  - green for FIND
+  - yellow for MEET
 
-## Implementation Notes
+## Buttons (Current)
 
-### NVS Initialization
+- Up: move selection up
+- Down: move selection down
+- Right: send MEET request to selected friend
+- Left: reserved
+- A: reserved
+- B: reserved
 
-Before accessing any NVS data, initialize both the system NVS and the `user_data` partition:
+Main event handler currently processes click events only.
 
-```c
-#include "nvs_flash.h"
+## Storage Model
 
-void app_main(void) {
-    // Initialize default NVS partition (required by ESP-IDF)
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || 
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
-    
-    // Initialize user_data partition (created by bootloader)
-    // This partition is NEVER erased by OTA updates
-    ret = nvs_flash_init_partition(WIFI_CONFIG_NVS_PARTITION);
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || 
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase_partition(WIFI_CONFIG_NVS_PARTITION);
-        nvs_flash_init_partition(WIFI_CONFIG_NVS_PARTITION);
-    }
-    
-    // Check if badge has been configured with a name via bootloader
-    if (!is_badge_configured()) {
-        // Display error - user must configure via bootloader first
-        display_error("Not Configured!",
-                     "Press RESET, then hold BOOT",
-                     "to enter bootloader setup");
-        
-        // Or optionally: return to factory partition
-        // const esp_partition_t *factory = 
-        //     esp_partition_find_first(ESP_PARTITION_TYPE_APP,
-        //                            ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
-        // esp_ota_set_boot_partition(factory);
-        // esp_restart();
-        return;
-    }
-    
-    // Continue with app initialization...
-}
+### Bootloader-owned values
 
-bool is_badge_configured(void) {
-    nvs_handle_t h;
-    if (nvs_open_from_partition(WIFI_CONFIG_NVS_PARTITION,
-                                WIFI_CONFIG_NVS_NAMESPACE,
-                                NVS_READONLY, &h) != ESP_OK) {
-        return false;
-    }
-    
-    char nick[33] = {0};
-    size_t len = sizeof(nick);
-    esp_err_t err = nvs_get_str(h, WIFI_CONFIG_NVS_KEY_NICK, nick, &len);
-    nvs_close(h);
-    
-    return (err == ESP_OK && nick[0] != '\0');
-}
-```
+- partition: user_data
+- namespace: badge_cfg
+- key used by this app: nick
 
-### BLE Configuration
+### App-owned values
 
-- **Advertisement Interval**: 100-200 ms (balance between discoverability and power)
-- **Scan Interval**: Continuous or periodic scanning
-- **Scan Window**: Optimize for power vs. responsiveness
-- **TX Power**: Adjustable based on desired range
+- namespace: friends_app
+- historical keys: met_count and met_list
+- current behavior clears these at startup
 
-### Data Storage
+## Notes for Future Changes
 
-**NVS Partition: `user_data`**
-
-The bootloader creates a dedicated `user_data` NVS partition at the top of flash memory that is **never overwritten by OTA updates**. This ensures user data persists even when firmware is updated.
-
-**User's Name:**
-
-Read from the existing bootloader configuration:
-
-```c
-#define WIFI_CONFIG_NVS_PARTITION  "user_data"
-#define WIFI_CONFIG_NVS_NAMESPACE  "badge_cfg"
-#define WIFI_CONFIG_NVS_KEY_NICK   "nick"
-
-// Initialize partition
-nvs_flash_init_partition(WIFI_CONFIG_NVS_PARTITION);
-
-// Read nickname
-nvs_handle_t h;
-nvs_open_from_partition(WIFI_CONFIG_NVS_PARTITION,
-                       WIFI_CONFIG_NVS_NAMESPACE,
-                       NVS_READONLY, &h);
-
-char nickname[33] = {0};
-size_t len = sizeof(nickname);
-nvs_get_str(h, WIFI_CONFIG_NVS_KEY_NICK, nickname, &len);
-nvs_close(h);
-```
-
-**Met People List:**
-
-Store met people in the same `user_data` partition using a dedicated namespace:
-
-```c
-#define FRIENDS_NVS_NAMESPACE  "friends_app"
-#define FRIENDS_NVS_KEY_MET    "met_list"
-
-// Store met people as a blob (array of MAC addresses)
-typedef struct {
-    uint8_t mac[6];
-} met_person_t;
-
-nvs_handle_t h;
-nvs_open_from_partition(WIFI_CONFIG_NVS_PARTITION,
-                       FRIENDS_NVS_NAMESPACE,
-                       NVS_READWRITE, &h);
-
-met_person_t met_list[256];  // Max 256 people
-size_t count = load_met_count();
-nvs_set_blob(h, FRIENDS_NVS_KEY_MET, met_list, count * sizeof(met_person_t));
-nvs_commit(h);
-nvs_close(h);
-```
-
-**In-Memory Tracking:**  
-- Active nearby people (currently visible on scan)
-- Selection cursor position
-- RSSI values for proximity sorting
-- Loaded met people MAC addresses for filtering
-
-### Data Format
-
-**BLE Advertisement Packet Structure:**
-
-Use a custom 128-bit UUID to identify namebadge devices, and include the nickname in the advertisement data:
-
-```c
-// Custom UUID for BYUI Namebadge (example)
-// Generate your own at https://www.uuidgenerator.net/
-#define NAMEBADGE_SERVICE_UUID  "12345678-1234-5678-1234-56789abcdef0"
-
-// Advertisement data structure:
-// - Flags (3 bytes)
-// - Complete 128-bit Service UUID (19 bytes)
-// - Service Data: UUID + name (up to 31 bytes total in name)
-//
-// BLE advertisement max payload: 31 bytes
-// After flags + UUID headers: ~20-25 bytes available for name
-
-// Example using ESP-IDF NimBLE:
-static void set_advertisement_data(const char *nickname) {
-    struct ble_hs_adv_fields fields = {0};
-    
-    // Standard BLE flags
-    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    
-    // Custom service UUID (identifies this as a namebadge)
-    ble_uuid128_t svc_uuid;
-    ble_uuid_from_str(NAMEBADGE_SERVICE_UUID, &svc_uuid.u);
-    fields.uuids128 = &svc_uuid;
-    fields.num_uuids128 = 1;
-    fields.uuids128_is_complete = 1;
-    
-    // Include name in service data (truncate if needed)
-    uint8_t svc_data[32];
-    size_t name_len = strlen(nickname);
-    if (name_len > 25) name_len = 25;  // Leave room for UUID
-    memcpy(svc_data, nickname, name_len);
-    
-    fields.svc_data_uuid128 = svc_data;
-    fields.svc_data_uuid128_len = name_len;
-    
-    ble_gap_adv_set_fields(&fields);
-}
-```
-
-**Scan Result Parsing:**
-
-```c
-// Extract name from advertisement data when scanning
-static void scan_callback(struct ble_gap_event *event, void *arg) {
-    if (event->type == BLE_GAP_EVENT_DISC) {
-        struct ble_gap_disc_desc *disc = &event->disc;
-        
-        // Check if this is a namebadge (has our service UUID)
-        if (has_namebadge_uuid(disc)) {
-            // Extract MAC address
-            uint8_t mac[6];
-            memcpy(mac, disc->addr.val, 6);
-            
-            // Check if already met
-            if (is_already_met(mac)) {
-                return;  // Skip this person
-            }
-            
-            // Extract name from service data
-            char name[32];
-            extract_name_from_adv(disc->data, disc->length_data, name);
-            
-            // Add to nearby list
-            add_nearby_person(name, mac, disc->rssi);
-        }
-    }
-}
-```
-
-### UI Considerations
-
-- Display shows list of nearby friends (scrollable if > 8-10 names)
-- Names fade out or are removed after not seen for X seconds
-- Optional: sort by signal strength (closest first)
-
-## ESP32-S3 BLE Support
-
-The ESP32-S3 includes BLE 5.0 support:
-- Supports both BLE advertising and scanning simultaneously
-- Low power consumption in BLE mode
-- Compatible with ESP-IDF BLE stack (Bluedroid or NimBLE)
-
-## Power Considerations
-
-| Mode | Current Draw |
-|------|-------------|
-| BLE advertising + scanning | ~20-30 mA |
-| BLE with display active | ~50-80 mA |
-| Sleep between scans | Can reduce to <1 mA |
-
-## Privacy & Security
-
-- Names are broadcast publicly (no pairing required)
-- BLE MAC addresses are used to track met people
-- Optional: allow user to disable broadcasting (stealth mode)
-- Optional: use MAC address randomization (requires BLE privacy feature)
-- Consider: nickname vs. full name for privacy
-
-**Note**: The bootloader's configuration portal collects the nickname during initial setup. Users should be advised to use a display name they're comfortable broadcasting publicly.
-
-## OTA Application Details
-
-This is an **OTA application** that runs on the BYUI eBadge bootloader platform:
-
-### Installation
-
-1. Badge must be configured via bootloader (nickname, WiFi) first
-2. Install via bootloader's "OTA App Download" menu:
-   - Press RESET + BOOT to enter factory loader
-   - Select "OTA App Download"
-   - Choose "Friends Around Me" from the app catalog
-   - Download completes, badge reboots into this app
-
-### Bootloader Integration
-
-- **Partition Layout**: Installed in `ota_0`, `ota_1`, or `ota_2` partition (960 KB)
-- **NVS Partition**: Uses existing `user_data` at 0x7E0000 (8MB) or 0x3E0000 (4MB)
-- **Configuration**: Reads nickname from bootloader's `badge_cfg` namespace (no setup needed)
+If persistence is re-enabled, update this file and README together, and clearly
+document migration behavior for existing badges.
 - **Persistent Storage**: Met people list survives OTA updates (stored in `user_data`)
 - **Return to Loader**: User can re-enter bootloader anytime (RESET + hold BOOT)
 
