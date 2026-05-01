@@ -23,7 +23,7 @@
 #define DISP_PIN_RST   48
 #define DISP_PIN_CLK   12
 #define DISP_PIN_MOSI  11
-#define DISP_PIN_MISO  -1   /* write-only — no MISO needed for display */
+#define DISP_PIN_MISO  10   /* GPIO10 — needed for display ID reads */
 #define DISP_SPI_HOST  SPI2_HOST
 #define DISP_SPI_FREQ  SPI_MASTER_FREQ_40M
 
@@ -252,6 +252,34 @@ static void ili9341_init_regs(void)
     disp_cmd(0x29);                                     /* display on */
 }
 
+/* Read a display register (ILI9341 4-wire SPI half-duplex read).
+ * Sends cmd+dummy_bytes on MOSI while capturing MISO simultaneously.
+ * Returns up to 4 data bytes packed into a uint32_t (byte[0] = MSB). */
+static uint32_t read_reg(uint8_t cmd, int nbytes)
+{
+    /* Full-duplex: tx cmd + (nbytes+1) zeros, rx same length.
+     * MISO byte[0] is received during the CMD byte (garbage).
+     * MISO bytes[1..nbytes] are the actual register values. */
+    int total = 1 + nbytes;
+    uint8_t tx[5] = {cmd, 0, 0, 0, 0};
+    uint8_t rx[5] = {0};
+    spi_transaction_t t = {
+        .length    = (size_t)total * 8,
+        .rxlength  = (size_t)total * 8,
+        .tx_buffer = tx,
+        .rx_buffer = rx,
+        .user      = (void *)0,  /* DC=0 during cmd byte */
+    };
+    esp_err_t err = spi_device_polling_transmit(s_spi, &t);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "read_reg(0x%02X) SPI error: %s", cmd, esp_err_to_name(err));
+        return 0xFFFFFFFF;
+    }
+    uint32_t val = 0;
+    for (int i = 1; i <= nbytes; i++) val = (val << 8) | rx[i];
+    return val;
+}
+
 static void spi_and_gpio_init(void)
 {
     gpio_config_t io = {
@@ -294,6 +322,30 @@ esp_err_t display_init(void)
     spi_and_gpio_init();
     ili9341_hw_reset();
     ili9341_init_regs();
+
+    /* Read display ID — ILI9341 should return 0x009341; ST7789 returns 0x008552 */
+    uint32_t id = read_reg(0x04, 3);
+    ESP_LOGI(TAG, "Display RDDID = 0x%06lX (ILI9341=0x009341, ST7789=0x008552)", (unsigned long)id);
+
+    /* Read display power mode — bit4=sleep(0=awake), bit2=display_on */
+    uint32_t pm = read_reg(0x0A, 1);
+    ESP_LOGI(TAG, "Display power mode = 0x%02lX (expect 0x9C: awake+display_on)", (unsigned long)pm);
+
+    /* Diagnostic fill cycle: white → red → green → black.
+     * If the backlight is on and the panel works, each fill is unmissable.
+     * If NOTHING appears during this 3-second window, the backlight is off
+     * or SPI signals are not reaching the display panel. */
+    ESP_LOGI(TAG, "DIAG: filling white ...");
+    display_fill(0xFFFF);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_LOGI(TAG, "DIAG: filling red ...");
+    display_fill(0xF800);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_LOGI(TAG, "DIAG: filling green ...");
+    display_fill(0x07E0);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    display_fill(0x0000);
+
     ESP_LOGI(TAG, "Display ready");
     return ESP_OK;
 }

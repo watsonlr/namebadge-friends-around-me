@@ -8,6 +8,8 @@
 #include "ble_scanning.h"
 #include "met_tracker.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -185,6 +187,14 @@ esp_err_t ui_init(void)
     
     /* Clear screen */
     display_fill(COLOR_BLACK);
+    
+    /* Test pattern to verify display is working */
+    ESP_LOGI(TAG, "Drawing test pattern...");
+    display_fill_rect(0, 0, 100, 100, COLOR_RED);
+    display_fill_rect(100, 0, 100, 100, COLOR_GREEN);
+    display_fill_rect(200, 0, 120, 100, COLOR_BLUE);
+    display_draw_string(10, 120, "DISPLAY TEST", COLOR_WHITE, COLOR_BLACK, 2);
+    vTaskDelay(pdMS_TO_TICKS(2000));  /* Show test pattern for 2 seconds */
     
     ESP_LOGI(TAG, "UI initialized successfully");
     return ESP_OK;
