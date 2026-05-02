@@ -9,6 +9,7 @@
 #include "ble_advertising.h"
 #include "met_tracker.h"
 #include "leds.h"
+#include "app_version.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -47,10 +48,16 @@ static int scroll_offset = 0;
 static bool need_redraw = true;
 static uint32_t blink_tick = 0;
 
-/* "Now friends with X" overlay state. */
+/* Full-screen overlay state. Kind picks the wording in draw_announcement. */
 #define ANNOUNCEMENT_DURATION_US (3LL * 1000 * 1000)
+typedef enum {
+    ANN_NONE = 0,
+    ANN_NOW_FRIENDS_I_INITIATED,
+    ANN_NOW_FRIENDS_THEY_INITIATED,
+    ANN_HELLO_FROM,
+} announcement_kind_t;
 static char announcement_text[MAX_NICKNAME_LEN + 1] = {0};
-static bool announcement_i_initiated = false;
+static announcement_kind_t announcement_kind = ANN_NONE;
 static int64_t announcement_until_us = 0;
 
 /* Draw text horizontally centred at the given y, white-on-black. */
@@ -65,18 +72,34 @@ static void draw_centered(int16_t y, const char *text, uint8_t scale)
 /* Full-screen "now friends with <name>" overlay. The opening line varies
  * by who initiated the meet — "I am now…" if we did, "You are now…" if
  * the other side asked first and we accepted. */
-static void draw_announcement(const char *nickname, bool i_initiated)
+static void draw_announcement(const char *nickname, announcement_kind_t kind)
 {
     display_fill(COLOR_BLACK);
-    draw_centered(40, i_initiated ? "I am now" : "You are now", 3);
-    draw_centered(85, "friends with", 3);
+
+    int nick_y = 150;   /* default y for the big nickname line */
+    switch (kind) {
+        case ANN_NOW_FRIENDS_I_INITIATED:
+            draw_centered(40, "I am now",     3);
+            draw_centered(85, "friends with", 3);
+            break;
+        case ANN_NOW_FRIENDS_THEY_INITIATED:
+            draw_centered(40, "You are now",  3);
+            draw_centered(85, "friends with", 3);
+            break;
+        case ANN_HELLO_FROM:
+            draw_centered(60, "Hello from",   3);
+            nick_y = 130;
+            break;
+        default:
+            break;
+    }
 
     /* Pick the largest scale the nickname will fit in (320 px wide). */
     int len = (int)strlen(nickname);
     uint8_t scale = 4;
     while (scale > 1 && len * 8 * scale > DISPLAY_WIDTH) scale--;
-    int y = (scale >= 3) ? 150 : 160;
-    draw_centered((int16_t)y, nickname, scale);
+    if (kind != ANN_HELLO_FROM && scale < 3) nick_y = 160;
+    draw_centered((int16_t)nick_y, nickname, scale);
 }
 
 /**
@@ -237,11 +260,11 @@ static void draw_friends_list(void)
 
     if (active_count == 0) {
         const char *msg1 = (current_view == VIEW_MET)
-            ? "No met friends" : "No friends nearby";
+            ? "No met friends" : "No new friends";
         const char *msg2 = (current_view == VIEW_MET)
-            ? "in range" : "yet...";
-        display_draw_string(50, 110, msg1, COLOR_GRAY, COLOR_BLACK, 2);
-        display_draw_string(90, 140, msg2, COLOR_GRAY, COLOR_BLACK, 2);
+            ? "in range" : "nearby";
+        draw_centered(110, msg1, 2);
+        draw_centered(140, msg2, 2);
         return;
     }
 
@@ -313,6 +336,35 @@ static flash_summary_t scan_flash_summary(void)
     return s;
 }
 
+/* Repaint just the flashing rows in the visible window — leaves the
+ * header, footer, and non-flashing rows alone so they don't flicker. */
+static void redraw_flashing_rows(bool flash_on)
+{
+    int count = 0;
+    const nearby_friend_t *friends = ble_scanning_get_nearby_friends(&count);
+
+    uint8_t my_kind;
+    uint8_t my_target[2];
+    ble_advertising_get_target(&my_kind, my_target);
+
+    const nearby_friend_t *active_friends[MAX_NEARBY_FRIENDS];
+    int active_count = build_visible_list(friends, active_friends);
+
+    int y = LIST_START_Y;
+    for (int i = 0; i < LIST_MAX_VISIBLE && (scroll_offset + i) < active_count; i++) {
+        int idx = scroll_offset + i;
+        row_flash_t flash = row_flash_for(active_friends[idx], my_kind, my_target);
+        if (flash != ROW_FLASH_NONE) {
+            bool is_selected = (idx == selected_index);
+            draw_list_item((int16_t)y,
+                           active_friends[idx]->nickname,
+                           active_friends[idx]->rssi,
+                           is_selected, flash, flash_on);
+        }
+        y += LIST_ITEM_HEIGHT;
+    }
+}
+
 esp_err_t ui_init(void)
 {
     ESP_LOGI(TAG, "Initializing UI...");
@@ -349,57 +401,54 @@ void ui_refresh(void)
     bool announce_just_ended = (announcement_until_us > 0 &&
                                 now_us >= announcement_until_us);
 
-    if (announce_active) {
+    /* FIND requests auto-expire — let the advertiser tick that. */
+    ble_advertising_check_target_timeout();
+
+    flash_summary_t fs = scan_flash_summary();
+
+    /* LEDs follow scan state every tick — even during an overlay — so a
+     * "Hello from X" greeting can blink the bar green at the same time. */
+    if (fs.any_flashing) blink_tick++;
+    bool blink_on = (blink_tick & 1) == 0;
+    if (blink_on && fs.incoming_find) {
+        leds_fill(0, 8, 0);
+    } else if (blink_on && fs.incoming_meet) {
+        leds_fill(8, 6, 0);
+    } else {
         leds_clear();
-        leds_show();
+    }
+    leds_show();
+
+    if (announce_active) {
         if (need_redraw) {
-            draw_announcement(announcement_text, announcement_i_initiated);
+            draw_announcement(announcement_text, announcement_kind);
             need_redraw = false;
         }
         return;
     }
     if (announce_just_ended) {
         announcement_until_us = 0;
+        announcement_kind = ANN_NONE;
         announcement_text[0] = '\0';
         need_redraw = true;   /* repaint the list now that we're back */
     }
+    if (!need_redraw && !fs.any_flashing) return;
 
-    /* FIND requests auto-expire — let the advertiser tick that. */
-    ble_advertising_check_target_timeout();
+    if (need_redraw) {
+        int nearby_count = 0;
+        ble_scanning_get_nearby_friends(&nearby_count);
+        int met_count = met_tracker_get_count();
 
-    flash_summary_t fs = scan_flash_summary();
-    if (!need_redraw && !fs.any_flashing) {
-        leds_clear();
-        leds_show();
-        return;
-    }
+        draw_header();
+        draw_friends_list();
+        draw_footer(nearby_count, met_count);
 
-    if (fs.any_flashing) {
-        blink_tick++;
-    }
-    bool blink_on = (blink_tick & 1) == 0;
-
-    /* LED bar: green when someone is finding me, yellow when someone is
-     * trying to meet me, off otherwise. Green wins if both are present. */
-    if (blink_on && fs.incoming_find) {
-        leds_fill(0, 8, 0);   /* low-intensity green */
-    } else if (blink_on && fs.incoming_meet) {
-        leds_fill(8, 6, 0);   /* low-intensity yellow */
+        need_redraw = false;
     } else {
-        leds_clear();
+        /* Flash-only tick: repaint just the flashing rows so the header
+         * and footer don't flicker every cycle. */
+        redraw_flashing_rows(blink_on);
     }
-    leds_show();
-
-    int nearby_count = 0;
-    ble_scanning_get_nearby_friends(&nearby_count);
-
-    int met_count = met_tracker_get_count();
-
-    draw_header();
-    draw_friends_list();
-    draw_footer(nearby_count, met_count);
-
-    need_redraw = false;
 }
 
 /* Helper: number of rows visible in the current view. */
@@ -501,14 +550,89 @@ void ui_force_redraw(void)
     need_redraw = true;
 }
 
-void ui_show_friend_announcement(const char *nickname, bool i_initiated)
+static void start_overlay(announcement_kind_t kind, const char *nickname)
 {
     if (nickname == NULL) return;
     strncpy(announcement_text, nickname, sizeof(announcement_text) - 1);
     announcement_text[sizeof(announcement_text) - 1] = '\0';
-    announcement_i_initiated = i_initiated;
+    announcement_kind = kind;
     announcement_until_us = esp_timer_get_time() + ANNOUNCEMENT_DURATION_US;
     need_redraw = true;
+}
+
+void ui_show_friend_announcement(const char *nickname, bool i_initiated)
+{
+    start_overlay(i_initiated ? ANN_NOW_FRIENDS_I_INITIATED
+                              : ANN_NOW_FRIENDS_THEY_INITIATED,
+                  nickname);
+}
+
+void ui_show_hello(const char *nickname)
+{
+    start_overlay(ANN_HELLO_FROM, nickname);
+}
+
+void ui_show_splash(void)
+{
+    /* Centered text on a white background; color picked per-line. */
+    display_fill(COLOR_WHITE);
+
+    #define SPLASH_LINE(y, scale, fg, bg, txt) do {                         \
+        int _w = (int)strlen(txt) * 8 * (scale);                            \
+        int _x = (DISPLAY_WIDTH - _w) / 2;                                  \
+        if (_x < 0) _x = 0;                                                 \
+        display_draw_string((int16_t)_x, (int16_t)(y), (txt),               \
+                            (fg), (bg), (scale));                           \
+    } while (0)
+
+    /* Title (scale 2). */
+    SPLASH_LINE(8,   2, COLOR_BLUE, COLOR_WHITE, "Welcome to:");
+    SPLASH_LINE(32,  2, COLOR_BLUE, COLOR_WHITE, "'Friends Around Me'");
+
+    /* Body — same scale 2 as the title; lines fit the 320-px width
+     * (20 chars max at this scale). */
+    SPLASH_LINE(64,  2, COLOR_BLUE, COLOR_WHITE, "BTLE 'finds' friends");
+
+    /* "Buttons:" — left-aligned, red. */
+    display_draw_string(8, 84, "Buttons:", COLOR_RED, COLOR_WHITE, 2);
+
+    /* Each U/D / R / L line is padded to 20 chars total — leading spaces
+     * line the colons up at column 3, trailing spaces keep centering
+     * identical so all three lines start at x=0. We then overdraw the
+     * 4-char prefix in red to highlight the key labels. */
+    /* No space between the colon and the description; trailing padding
+     * keeps every line at 20 chars so the colons stay vertically aligned. */
+    SPLASH_LINE(104, 2, COLOR_BLUE, COLOR_WHITE, "U/D:select a friend ");
+    display_draw_string(0, 104, "U/D:", COLOR_RED, COLOR_WHITE, 2);
+
+    SPLASH_LINE(124, 2, COLOR_BLUE, COLOR_WHITE, "  R:send/ack request");
+    display_draw_string(0, 124, "  R:", COLOR_RED, COLOR_WHITE, 2);
+
+    SPLASH_LINE(144, 2, COLOR_BLUE, COLOR_WHITE, "  L:find <-> found  ");
+    display_draw_string(0, 144, "  L:", COLOR_RED, COLOR_WHITE, 2);
+
+    /* Bottom black band carries both the call to action (green) and the
+     * "Just play with it." cheer (white) on the same dark background. */
+    display_fill_rect(0, 174, DISPLAY_WIDTH, 66, COLOR_BLACK);
+    SPLASH_LINE(182, 2, COLOR_GREEN, COLOR_BLACK, "Press 'A' to start");
+    {
+        /* "Just play" centered (scale 2). "v<version>" pinned to the
+         * right edge at half-scale, bottom-aligned with "Just play". */
+        const char *play = "Just play";
+        const int  play_w = (int)strlen(play) * 8 * 2;
+        const int  play_x = (DISPLAY_WIDTH - play_w) / 2;
+        display_draw_string((int16_t)play_x, 210, play,
+                            COLOR_WHITE, COLOR_BLACK, 2);
+
+        char ver[16];
+        snprintf(ver, sizeof(ver), "v%s", APP_VERSION);
+        const int ver_w = (int)strlen(ver) * 8 * 1;
+        const int ver_x = DISPLAY_WIDTH - ver_w - 8;   /* 8 px right margin */
+        display_draw_string((int16_t)ver_x, 218, ver,
+                            COLOR_WHITE, COLOR_BLACK, 1);
+    }
+
+    #undef SPLASH_LINE
 }
 
 bool ui_selected_is_requesting_me(void)

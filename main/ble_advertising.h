@@ -128,9 +128,20 @@ void ble_advertising_set_target(uint8_t kind, uint8_t b0, uint8_t b1);
 void ble_advertising_get_target(uint8_t *kind, uint8_t out[2]);
 
 /**
- * @brief Auto-clear an outgoing FIND request once it has been broadcasting
- * for the built-in send window. Safe to call frequently from any task.
+ * @brief Auto-clear an outgoing target whose deadline has passed.
+ *
+ * Used by the FIND auto-timeout and by the post-bilateral grace period
+ * (see ble_advertising_clear_target_after). Safe to call frequently.
  */
 void ble_advertising_check_target_timeout(void);
+
+/**
+ * @brief Schedule the current outgoing target to auto-clear in delay_us.
+ *
+ * Lets the bilateral-handshake winner keep advertising their MEET target
+ * a little longer so the other side has time to see it and complete its
+ * own handshake before either side stops broadcasting.
+ */
+void ble_advertising_clear_target_after(int64_t delay_us);
 
 #endif /* BLE_ADVERTISING_H */

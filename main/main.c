@@ -29,6 +29,7 @@
 #include "ui.h"
 #include "buttons.h"
 #include "met_tracker.h"
+#include "leds.h"
 
 static const char *TAG = "FRIENDS_APP";
 
@@ -140,6 +141,10 @@ static void ui_task(void *param)
     }
 }
 
+/* Set when we press Right while the selected friend is NOT yet requesting
+ * us — i.e., we're the side initiating the meet, not accepting one. */
+static bool g_i_initiated_meet = false;
+
 /**
  * @brief Callback for nearby friends list updates
  */
@@ -147,18 +152,37 @@ static void on_friends_update(void)
 {
     int count = 0;
     const nearby_friend_t *friends = ble_scanning_get_nearby_friends(&count);
-    
+
     ESP_LOGI(TAG, "Nearby friends updated: %d active", count);
-    
-    /* List all active, non-met friends */
+
     for (int i = 0; i < MAX_NEARBY_FRIENDS; i++) {
         if (friends[i].is_active && !friends[i].is_met) {
             ESP_LOGI(TAG, "  - %s (RSSI: %d dBm)", friends[i].nickname, friends[i].rssi);
         }
     }
-    
-    /* Trigger UI update */
+
     ui_force_redraw();
+}
+
+/**
+ * @brief Callback fired when a meet handshake completes both ways.
+ * Just queues the celebration overlay — UI task does the real drawing.
+ */
+static void on_friend_met(const char *nickname)
+{
+    ESP_LOGI(TAG, "Now friends with %s (initiated=%d)", nickname, g_i_initiated_meet);
+    ui_show_friend_announcement(nickname, g_i_initiated_meet);
+    g_i_initiated_meet = false;
+}
+
+/**
+ * @brief Callback fired when an already-met friend pings us via FIND.
+ * Display "Hello from <them>" while their LEDs/row keep flashing green.
+ */
+static void on_friend_find(const char *nickname)
+{
+    ESP_LOGI(TAG, "Find request from %s", nickname);
+    ui_show_hello(nickname);
 }
 
 /**
@@ -183,27 +207,31 @@ static void on_button_event(button_event_t event)
         break;
         
     case BUTTON_RIGHT:
-        /* Send a meet request to the selected friend.
-         * The handshake completes (both → met) only when the other side
-         * also presses Right and we see their adv targeting us. */
+        /* In TO_MEET view: meet request (handshake → marks both met).
+         * In MET view: one-way "find me" → flashes their LEDs green. */
         {
             uint8_t addr[6];
-            if (ui_get_selected_addr(addr) == ESP_OK) {
-                /* addr is NimBLE-order (LSB first); the wire target uses
-                 * esp_read_mac order, so swap the last two bytes. */
-                ble_advertising_set_target(addr[1], addr[0]);
-                ESP_LOGI(TAG, "Button RIGHT - meet request → %02X:%02X",
-                         addr[1], addr[0]);
-                ui_force_redraw();
-            } else {
-                ESP_LOGI(TAG, "Button RIGHT clicked - no friend selected");
+            if (ui_get_selected_addr(addr) != ESP_OK) {
+                ESP_LOGI(TAG, "Button RIGHT - no friend selected");
+                break;
             }
+            uint8_t b0 = addr[1], b1 = addr[0];
+            if (ui_in_met_view()) {
+                ble_advertising_set_target(BLE_TARGET_FIND, b0, b1);
+                ESP_LOGI(TAG, "Button RIGHT - find request → %02X:%02X", b0, b1);
+            } else {
+                g_i_initiated_meet = !ui_selected_is_requesting_me();
+                ble_advertising_set_target(BLE_TARGET_MEET, b0, b1);
+                ESP_LOGI(TAG, "Button RIGHT - meet request → %02X:%02X (initiated=%d)",
+                         b0, b1, g_i_initiated_meet);
+            }
+            ui_force_redraw();
         }
         break;
-        
+
     case BUTTON_LEFT:
-        /* Future: undo or show met list */
-        ESP_LOGI(TAG, "Button LEFT clicked (not implemented)");
+        ESP_LOGI(TAG, "Button LEFT clicked - toggle view");
+        ui_toggle_view();
         break;
         
     case BUTTON_A:
@@ -221,6 +249,18 @@ static void on_button_event(button_event_t event)
     }
 }
 
+/* Set true once the user clicks BUTTON_A on the splash. Until then we
+ * intentionally don't init/start BLE so the badge isn't broadcasting. */
+static volatile bool g_app_started = false;
+
+/* Splash-only button handler — only BUTTON_A's click matters here. */
+static void splash_button_event(button_event_t event)
+{
+    if (event.event == BUTTON_EVENT_CLICK && event.button == BUTTON_A) {
+        g_app_started = true;
+    }
+}
+
 /**
  * @brief Application entry point
  */
@@ -230,7 +270,7 @@ void app_main(void)
     ESP_LOGI(TAG, "  Friends Around Me - BYUI eBadge App");
     ESP_LOGI(TAG, "===========================================");
     ESP_LOGI(TAG, "");
-    
+
     // Initialize NVS
     ESP_ERROR_CHECK(init_nvs());
 
@@ -244,12 +284,35 @@ void app_main(void)
         esp_read_mac(mac, ESP_MAC_BT);
         snprintf(nickname, sizeof(nickname), "badge-%02X%02X", mac[4], mac[5]);
     }
-
     ESP_LOGI(TAG, "Badge nickname: %s", nickname);
-    
-    // Initialize met people tracking
+
+    if (!leds_init()) {
+        ESP_LOGE(TAG, "leds_init failed - continuing without LEDs");
+    } else {
+        leds_clear();
+        leds_show();
+    }
+
     ESP_ERROR_CHECK(init_met_people());
-    
+
+    // Initialize display so we can paint the splash.
+    ESP_ERROR_CHECK(ui_init());
+    ui_set_nickname(nickname);
+    ui_show_splash();
+
+    // Buttons online so we can detect the BUTTON_A start press.
+    ESP_ERROR_CHECK(buttons_init());
+    buttons_register_callback(splash_button_event);
+
+    ESP_LOGI(TAG, "Splash up — waiting for BUTTON_A...");
+    while (!g_app_started) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    ESP_LOGI(TAG, "BUTTON_A pressed — starting BLE.");
+
+    // Hand button events back to the regular handler before BLE goes live.
+    buttons_register_callback(on_button_event);
+
     // Initialize BLE advertising
     ESP_LOGI(TAG, "Initializing BLE advertising...");
     err = ble_advertising_init();
@@ -257,7 +320,6 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to initialize BLE advertising: %s", esp_err_to_name(err));
         ESP_LOGE(TAG, "Continuing without BLE...");
     } else {
-        // Start advertising with the badge nickname
         err = ble_advertising_start(nickname);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to start BLE advertising: %s", esp_err_to_name(err));
@@ -265,17 +327,17 @@ void app_main(void)
             ESP_LOGI(TAG, "BLE advertising started successfully");
         }
     }
-    
+
     // Initialize BLE scanning
     ESP_LOGI(TAG, "Initializing BLE scanning...");
     err = ble_scanning_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize BLE scanning: %s", esp_err_to_name(err));
     } else {
-        // Register update callback
         ble_scanning_register_update_callback(on_friends_update);
-        
-        // Start scanning for nearby badges
+        ble_scanning_register_meet_callback(on_friend_met);
+        ble_scanning_register_find_callback(on_friend_find);
+
         vTaskDelay(pdMS_TO_TICKS(500));  /* Small delay after advertising */
         err = ble_scanning_start();
         if (err != ESP_OK) {
@@ -284,33 +346,11 @@ void app_main(void)
             ESP_LOGI(TAG, "BLE scanning started successfully");
         }
     }
-    
-    // Start cleanup task
+
+    // Background tasks
     xTaskCreate(cleanup_task, "cleanup", 4096, NULL, 5, NULL);
-    
-    // Initialize UI and display
-    ESP_LOGI(TAG, "Initializing display and UI...");
-    err = ui_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize UI: %s", esp_err_to_name(err));
-    } else {
-        ui_set_nickname(nickname);
-        ui_force_redraw();
-        ESP_LOGI(TAG, "Display and UI initialized successfully");
-        
-        // Start UI refresh task
-        xTaskCreate(ui_task, "ui", 8192, NULL, 5, NULL);
-    }
-    
-    // Initialize buttons
-    ESP_LOGI(TAG, "Initializing button handlers...");
-    err = buttons_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize buttons: %s", esp_err_to_name(err));
-    } else {
-        buttons_register_callback(on_button_event);
-        ESP_LOGI(TAG, "Button handlers initialized successfully");
-    }
+    ui_force_redraw();   /* paint the friends UI over the splash */
+    xTaskCreate(ui_task, "ui", 8192, NULL, 5, NULL);
     
     // Application initialized
     ESP_LOGI(TAG, "Application initialized successfully");

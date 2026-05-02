@@ -25,6 +25,7 @@ static SemaphoreHandle_t friends_mutex = NULL;
 static bool is_scanning = false;
 static ble_scan_update_cb_t update_callback = NULL;
 static ble_scan_meet_cb_t   meet_callback   = NULL;
+static ble_scan_find_cb_t   find_callback   = NULL;
 
 /* Scan parameters */
 #define BLE_SCAN_INTERVAL_MS 100  /* How often to scan (100 ms) */
@@ -162,6 +163,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
         if (xSemaphoreTake(friends_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             int idx = find_friend_by_addr(event->disc.addr.val);
             bool list_changed = false;
+            bool just_finded = false;
 
             if (idx >= 0) {
                 /* Update existing entry — RSSI/last_seen don't trigger redraw. */
@@ -175,11 +177,18 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
                     list_changed = true;
                 }
 
-                if (nearby_friends[idx].they_request_me != they_request_me) {
-                    nearby_friends[idx].they_request_me = they_request_me;
+                /* Once a friend is met, suppress the "they're requesting me"
+                 * flash — the peer's MEET target stays advertised for a
+                 * couple of seconds after the handshake (post-bilateral
+                 * grace) and we don't want the row pulsing yellow then. */
+                bool effective_request_me = they_request_me &&
+                                            !nearby_friends[idx].is_met;
+                if (nearby_friends[idx].they_request_me != effective_request_me) {
+                    nearby_friends[idx].they_request_me = effective_request_me;
                     list_changed = true;
                 }
                 if (nearby_friends[idx].they_find_me != they_find_me) {
+                    if (they_find_me) just_finded = true;  /* rising edge */
                     nearby_friends[idx].they_find_me = they_find_me;
                     list_changed = true;
                 }
@@ -192,6 +201,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
                     nearby_friends[idx].is_met = met_tracker_is_met(nickname);
                     nearby_friends[idx].they_request_me = they_request_me;
                     nearby_friends[idx].they_find_me = they_find_me;
+                    if (they_find_me) just_finded = true;
                     memcpy(nearby_friends[idx].addr, event->disc.addr.val, 6);
                     strncpy(nearby_friends[idx].nickname, nickname, MAX_NICKNAME_LEN);
                     nearby_friends[idx].nickname[MAX_NICKNAME_LEN] = '\0';
@@ -207,8 +217,10 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
                 }
             }
 
-            /* Bilateral handshake → both have agreed to meet. Mark met,
-             * persist, and clear my outgoing target so we stop nagging them. */
+            /* Bilateral handshake → both have agreed to meet. Mark met
+             * locally, then schedule (rather than do) the target clear:
+             * the other side may not have seen our MEET yet, so we keep
+             * advertising it for a short grace period so they bilateral too. */
             bool just_met = false;
             if (idx >= 0 && i_meet_target_them && they_request_me &&
                 !nearby_friends[idx].is_met) {
@@ -216,7 +228,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
                 met_tracker_add(nickname);
                 nearby_friends[idx].is_met = true;
                 nearby_friends[idx].they_request_me = false;
-                ble_advertising_set_target(BLE_TARGET_NONE, 0, 0);
+                ble_advertising_clear_target_after(2LL * 1000 * 1000);
                 list_changed = true;
                 just_met = true;
             }
@@ -229,6 +241,9 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
             }
             if (just_met && meet_callback != NULL) {
                 meet_callback(nickname);
+            }
+            if (just_finded && find_callback != NULL) {
+                find_callback(nickname);
             }
         }
         
@@ -454,6 +469,12 @@ void ble_scanning_register_meet_callback(ble_scan_meet_cb_t callback)
 {
     meet_callback = callback;
     ESP_LOGI(TAG, "Meet callback %s", callback ? "registered" : "unregistered");
+}
+
+void ble_scanning_register_find_callback(ble_scan_find_cb_t callback)
+{
+    find_callback = callback;
+    ESP_LOGI(TAG, "Find callback %s", callback ? "registered" : "unregistered");
 }
 
 void ble_scanning_clear_all(void)

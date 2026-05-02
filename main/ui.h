@@ -92,6 +92,20 @@ void ui_force_redraw(void);
 void ui_show_friend_announcement(const char *nickname, bool i_initiated);
 
 /**
+ * @brief Take over the screen for ~3 s with "Hello from <name>".
+ *
+ * Used when an already-met friend pings us with the find feature.
+ */
+void ui_show_hello(const char *nickname);
+
+/**
+ * @brief Paint the boot splash (white background, blue text).
+ *
+ * Stays on screen until the next ui_force_redraw() / ui_refresh() runs.
+ */
+void ui_show_splash(void);
+
+/**
  * @brief True if the currently-selected friend is requesting us.
  *
  * Used at BUTTON_RIGHT time to decide whether pressing Right is an

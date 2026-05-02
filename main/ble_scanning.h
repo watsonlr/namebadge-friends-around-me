@@ -146,6 +146,16 @@ void ble_scanning_register_update_callback(ble_scan_update_cb_t callback);
 void ble_scanning_register_meet_callback(ble_scan_meet_cb_t callback);
 
 /**
+ * @brief Callback fired when an incoming FIND request arrives (rising edge).
+ *
+ * Receives the nickname of the friend who pressed Right on us in their
+ * "Friends I've Met" view.  Invoked from the BLE host task — keep handlers
+ * cheap (no SPI / display work).
+ */
+typedef void (*ble_scan_find_cb_t)(const char *nickname);
+void ble_scanning_register_find_callback(ble_scan_find_cb_t callback);
+
+/**
  * @brief Clear all nearby friends from the list
  * 
  * Removes all entries from the nearby friends list.

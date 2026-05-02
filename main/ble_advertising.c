@@ -307,10 +307,21 @@ void ble_advertising_get_target(uint8_t *kind, uint8_t out[2])
 
 void ble_advertising_check_target_timeout(void)
 {
-    if (my_target_kind == BLE_TARGET_FIND &&
+    if (my_target_kind != BLE_TARGET_NONE &&
         my_target_until_us > 0 &&
         esp_timer_get_time() >= my_target_until_us) {
-        ESP_LOGI(TAG, "FIND request expired — clearing target");
+        ESP_LOGI(TAG, "Target (kind=%d) expired — clearing", my_target_kind);
         ble_advertising_set_target(BLE_TARGET_NONE, 0, 0);
+    }
+}
+
+void ble_advertising_clear_target_after(int64_t delay_us)
+{
+    if (my_target_kind == BLE_TARGET_NONE) return;
+    int64_t deadline = esp_timer_get_time() + delay_us;
+    /* Pick whichever deadline fires first so we don't accidentally extend
+     * an existing FIND timeout. */
+    if (my_target_until_us == 0 || deadline < my_target_until_us) {
+        my_target_until_us = deadline;
     }
 }
