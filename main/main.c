@@ -24,6 +24,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_partition.h"
+#include "driver/gpio.h"
 #include "ble_advertising.h"
 #include "ble_scanning.h"
 #include "ui.h"
@@ -270,6 +271,13 @@ void app_main(void)
     ESP_LOGI(TAG, "  Friends Around Me - BYUI eBadge App");
     ESP_LOGI(TAG, "===========================================");
     ESP_LOGI(TAG, "");
+
+    /* Release any pins that the BYUI loader (or a previous OTA app) left
+     * in sleep-hold state. Without this, GPIO 1 (display RST) can stay
+     * latched HIGH across the esp_restart() that hands control to us, so
+     * the panel never sees a reset pulse and keeps the prior MADCTL —
+     * which manifests as the wrong display orientation after an OTA. */
+    gpio_force_unhold_all();
 
     // Initialize NVS
     ESP_ERROR_CHECK(init_nvs());

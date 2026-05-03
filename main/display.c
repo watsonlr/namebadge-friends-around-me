@@ -26,7 +26,7 @@
 #define DISP_PIN_MOSI  3
 #define DISP_PIN_MISO  -1   /* write-only — no MISO on this display */
 #define DISP_SPI_HOST  SPI2_HOST
-#define DISP_SPI_FREQ  SPI_MASTER_FREQ_40M
+#define DISP_SPI_FREQ  SPI_MASTER_FREQ_10M  /* lowered from 40M to test OTA orientation bug */
 
 static const char *TAG = "display";
 static spi_device_handle_t s_spi;
@@ -268,6 +268,16 @@ esp_err_t display_init(void)
 {
     ESP_LOGI(TAG, "Initialising SPI2 and ILI9341 (landscape 320x240)");
 
+    /* Belt-and-suspenders: explicitly release any sleep/regular hold on
+     * each display pin in case the previous app (BYUI loader) latched
+     * them. gpio_force_unhold_all() in app_main should already cover
+     * this, but doing it per-pin here too is cheap insurance. */
+    const int disp_pins[] = { DISP_PIN_RST, DISP_PIN_DC, DISP_PIN_CS,
+                              DISP_PIN_CLK, DISP_PIN_MOSI };
+    for (size_t i = 0; i < sizeof(disp_pins)/sizeof(disp_pins[0]); i++) {
+        gpio_hold_dis((gpio_num_t)disp_pins[i]);
+    }
+
     /* Assert RST LOW before SPI init. CS shares GPIO 0 with the BOOT button;
      * spi_bus_add_device() may glitch CS while reconfiguring the pin, but the
      * panel ignores all SPI activity while held in hardware reset. */
@@ -280,9 +290,9 @@ esp_err_t display_init(void)
 
     spi_and_gpio_init();
 
-    vTaskDelay(pdMS_TO_TICKS(10));   /* RST low hold: ILI9341 min is 10 µs */
+    vTaskDelay(pdMS_TO_TICKS(10));
     gpio_set_level(DISP_PIN_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(150));  /* post-reset stabilisation */
+    vTaskDelay(pdMS_TO_TICKS(150));
 
     ili9341_init_regs();
     display_fill(0x0000);
