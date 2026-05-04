@@ -42,6 +42,7 @@ typedef enum {
 
 /* UI State */
 static char user_nickname[33] = "Badge";
+static bool user_name_configured = false;
 static view_mode_t current_view = VIEW_TO_MEET;
 static int selected_index = 0;
 static int scroll_offset = 0;
@@ -396,6 +397,12 @@ void ui_set_nickname(const char *nickname)
     }
 }
 
+void ui_set_name_configured(bool configured)
+{
+    user_name_configured = configured;
+    need_redraw = true;
+}
+
 void ui_refresh(void)
 {
     /* Active "now friends" announcement takes over the screen. */
@@ -593,8 +600,19 @@ void ui_show_splash(void)
                             (fg), (bg), (scale));                           \
     } while (0)
 
-    /* Title (scale 2). */
-    SPLASH_LINE(8,   2, COLOR_BLUE, COLOR_WHITE, "Welcome to:");
+    /* Title (scale 2). When the badge already has a name configured we
+     * greet by name on line 1; otherwise show the generic welcome. */
+    if (user_name_configured) {
+        char welcome_line[48];
+        snprintf(welcome_line, sizeof(welcome_line), "Welcome: %s",
+                 user_nickname);
+        /* Drop to scale 1 if the personalised line overruns the scale-2
+         * 20-char budget (long nicknames). */
+        uint8_t wscale = (strlen(welcome_line) <= 20) ? 2 : 1;
+        SPLASH_LINE(8,  wscale, COLOR_BLUE, COLOR_WHITE, welcome_line);
+    } else {
+        SPLASH_LINE(8,   2, COLOR_BLUE, COLOR_WHITE, "Welcome to:");
+    }
     SPLASH_LINE(32,  2, COLOR_BLUE, COLOR_WHITE, "'Friends Around Me'");
 
     /* Body — same scale 2 as the title; lines fit the 320-px width
@@ -619,24 +637,20 @@ void ui_show_splash(void)
     SPLASH_LINE(144, 2, COLOR_BLUE, COLOR_WHITE, "  L:find <-> found  ");
     display_draw_string(0, 144, "  L:", COLOR_RED, COLOR_WHITE, 2);
 
-    /* Bottom black band carries both the call to action (green) and the
-     * "Just play with it." cheer (white) on the same dark background. */
+    /* Bottom black band carries the call to action (green), the BTN-B hint
+     * (white), and the version (small, right-pinned). */
     display_fill_rect(0, 174, DISPLAY_WIDTH, 66, COLOR_BLACK);
     SPLASH_LINE(182, 2, COLOR_GREEN, COLOR_BLACK, "Press 'A' to start");
-    {
-        /* "Just play" centered (scale 2). "v<version>" pinned to the
-         * right edge at half-scale, bottom-aligned with "Just play". */
-        const char *play = "Just play";
-        const int  play_w = (int)strlen(play) * 8 * 2;
-        const int  play_x = (DISPLAY_WIDTH - play_w) / 2;
-        display_draw_string((int16_t)play_x, 210, play,
-                            COLOR_WHITE, COLOR_BLACK, 2);
+    SPLASH_LINE(210, 2, COLOR_WHITE, COLOR_BLACK,
+                user_name_configured ? "'B': to rename"
+                                     : "'B': enter your name");
 
+    {
         char ver[16];
         snprintf(ver, sizeof(ver), "v%s", APP_VERSION);
         const int ver_w = (int)strlen(ver) * 8 * 1;
-        const int ver_x = DISPLAY_WIDTH - ver_w - 8;   /* 8 px right margin */
-        display_draw_string((int16_t)ver_x, 218, ver,
+        const int ver_x = DISPLAY_WIDTH - ver_w - 4;
+        display_draw_string((int16_t)ver_x, 230, ver,
                             COLOR_WHITE, COLOR_BLACK, 1);
     }
 

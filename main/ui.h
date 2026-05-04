@@ -30,6 +30,16 @@ esp_err_t ui_init(void);
 void ui_set_nickname(const char *nickname);
 
 /**
+ * @brief Tell the splash whether the current nickname was loaded from NVS
+ * (true) or auto-generated from the MAC at boot (false).
+ *
+ * When configured, the splash greets "Welcome: <name>" and the BTN-B hint
+ * reads "'B': to rename"; otherwise it shows the generic welcome and
+ * "'B': enter your name".
+ */
+void ui_set_name_configured(bool configured);
+
+/**
  * @brief Update the UI display
  * 
  * Refreshes the screen with current nearby friends list and selection.

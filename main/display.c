@@ -414,3 +414,92 @@ void display_set_backlight(bool on)
 {
     (void)on;  /* backlight is always on via hardware */
 }
+
+#include "qrcode.h"
+
+bool display_draw_qr(int cx, int cy, const char *text,
+                     int module_px, uint16_t fg, uint16_t bg)
+{
+    static uint8_t qr_buf[QR_BUFFER_LEN_MAX];
+    int qr_size = 0;
+
+    if (!qr_encode(text, qr_buf, &qr_size)) {
+        ESP_LOGE(TAG, "QR encode failed for: %s", text);
+        return false;
+    }
+
+    /* QR spec requires a 4-module quiet zone on every side. */
+    const int QUIET = 4;
+    int qz_px    = QUIET * module_px;
+    int total_px = (qr_size + 2 * QUIET) * module_px;
+
+    int x0 = cx - total_px / 2;
+    int y0 = cy - total_px / 2;
+
+    static uint8_t row_buf[DISPLAY_WIDTH * 2];
+    uint8_t bg_hi = (uint8_t)(bg >> 8);
+    uint8_t bg_lo = (uint8_t)(bg & 0xFF);
+
+    int sx0    = (x0 < 0) ? 0 : x0;
+    int sx1    = (x0 + total_px - 1 < DISPLAY_WIDTH)
+                 ? x0 + total_px - 1 : DISPLAY_WIDTH - 1;
+    int skip   = (x0 < 0) ? (-x0 * 2) : 0;
+    int nbytes = (sx1 - sx0 + 1) * 2;
+
+    int full_px = (total_px <= DISPLAY_WIDTH) ? total_px : DISPLAY_WIDTH;
+    for (int i = 0; i < full_px * 2;) {
+        row_buf[i++] = bg_hi;
+        row_buf[i++] = bg_lo;
+    }
+
+    #define SEND_ROW(sy) do {                                          \
+        int _sy = (sy);                                                \
+        if (_sy >= 0 && _sy < DISPLAY_HEIGHT && nbytes > 0) {          \
+            set_window((uint16_t)sx0, (uint16_t)_sy,                   \
+                       (uint16_t)sx1, (uint16_t)_sy);                  \
+            write_pixels(row_buf + skip, nbytes);                      \
+        }                                                              \
+    } while (0)
+
+    /* Top quiet zone */
+    for (int py = 0; py < qz_px; py++) SEND_ROW(y0 + py);
+
+    /* Data rows with quiet margins */
+    int data_y0 = y0 + qz_px;
+    for (int row = 0; row < qr_size; row++) {
+        int bi = 0;
+        for (int i = 0; i < qz_px; i++) {
+            row_buf[bi++] = bg_hi;
+            row_buf[bi++] = bg_lo;
+        }
+        for (int col = 0; col < qr_size; col++) {
+            bool dark    = qr_get_module(qr_buf, qr_size, col, row);
+            uint16_t color = dark ? fg : bg;
+            uint8_t hi = (uint8_t)(color >> 8);
+            uint8_t lo = (uint8_t)(color & 0xFF);
+            for (int p = 0; p < module_px; p++) {
+                if (bi / 2 >= DISPLAY_WIDTH) break;
+                row_buf[bi++] = hi;
+                row_buf[bi++] = lo;
+            }
+        }
+        for (int i = 0; i < qz_px && bi / 2 < DISPLAY_WIDTH; i++) {
+            row_buf[bi++] = bg_hi;
+            row_buf[bi++] = bg_lo;
+        }
+        for (int py = 0; py < module_px; py++) {
+            SEND_ROW(data_y0 + row * module_px + py);
+        }
+    }
+
+    /* Bottom quiet zone (rebuild solid bg row first) */
+    for (int i = 0; i < full_px * 2;) {
+        row_buf[i++] = bg_hi;
+        row_buf[i++] = bg_lo;
+    }
+    int bot_y0 = data_y0 + qr_size * module_px;
+    for (int py = 0; py < qz_px; py++) SEND_ROW(bot_y0 + py);
+
+    #undef SEND_ROW
+    return true;
+}

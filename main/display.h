@@ -131,4 +131,18 @@ void display_draw_string(int16_t x, int16_t y, const char *str, uint16_t color, 
  */
 void display_set_backlight(bool on);
 
+/**
+ * @brief Render a QR code centred at (cx, cy) with the given module size.
+ *
+ * @param cx        Centre X (pixels).
+ * @param cy        Centre Y (pixels).
+ * @param text      ASCII payload (URL, etc.).
+ * @param module_px Pixels per QR module (4–6 looks reasonable).
+ * @param fg        Foreground colour (dark modules).
+ * @param bg        Background colour (light modules + quiet zone).
+ * @return true on success, false if the payload is too long for the encoder.
+ */
+bool display_draw_qr(int cx, int cy, const char *text,
+                     int module_px, uint16_t fg, uint16_t bg);
+
 #endif /* DISPLAY_H */

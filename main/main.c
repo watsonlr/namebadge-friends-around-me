@@ -31,6 +31,7 @@
 #include "buttons.h"
 #include "met_tracker.h"
 #include "leds.h"
+#include "name_portal.h"
 
 static const char *TAG = "FRIENDS_APP";
 
@@ -250,16 +251,17 @@ static void on_button_event(button_event_t event)
     }
 }
 
-/* Set true once the user clicks BUTTON_A on the splash. Until then we
- * intentionally don't init/start BLE so the badge isn't broadcasting. */
+/* Splash-screen state. BUTTON_A starts the app; BUTTON_B opens the
+ * name-entry portal (SoftAP + form). Until A is pressed we don't init
+ * BLE so the badge isn't broadcasting. */
 static volatile bool g_app_started = false;
+static volatile bool g_open_name_portal = false;
 
-/* Splash-only button handler — only BUTTON_A's click matters here. */
 static void splash_button_event(button_event_t event)
 {
-    if (event.event == BUTTON_EVENT_CLICK && event.button == BUTTON_A) {
-        g_app_started = true;
-    }
+    if (event.event != BUTTON_EVENT_CLICK) return;
+    if (event.button == BUTTON_A) g_app_started = true;
+    if (event.button == BUTTON_B) g_open_name_portal = true;
 }
 
 /**
@@ -285,14 +287,15 @@ void app_main(void)
     // Get nickname (or fall back to a default if badge isn't configured)
     char nickname[33] = {0};
     esp_err_t err = get_badge_nickname(nickname, sizeof(nickname));
-    if (err != ESP_OK || nickname[0] == '\0') {
+    bool name_configured = (err == ESP_OK && nickname[0] != '\0');
+    if (!name_configured) {
         ESP_LOGW(TAG, "Badge not configured (%s) - using MAC-based nickname",
                  err == ESP_OK ? "empty nick" : esp_err_to_name(err));
         uint8_t mac[6] = {0};
         esp_read_mac(mac, ESP_MAC_BT);
         snprintf(nickname, sizeof(nickname), "badge-%02X%02X", mac[4], mac[5]);
     }
-    ESP_LOGI(TAG, "Badge nickname: %s", nickname);
+    ESP_LOGI(TAG, "Badge nickname: %s (configured=%d)", nickname, name_configured);
 
     if (!leds_init()) {
         ESP_LOGE(TAG, "leds_init failed - continuing without LEDs");
@@ -306,14 +309,30 @@ void app_main(void)
     // Initialize display so we can paint the splash.
     ESP_ERROR_CHECK(ui_init());
     ui_set_nickname(nickname);
+    ui_set_name_configured(name_configured);
     ui_show_splash();
 
     // Buttons online so we can detect the BUTTON_A start press.
     ESP_ERROR_CHECK(buttons_init());
     buttons_register_callback(splash_button_event);
 
-    ESP_LOGI(TAG, "Splash up — waiting for BUTTON_A...");
+    ESP_LOGI(TAG, "Splash up — waiting for BUTTON_A (or B for name entry)...");
     while (!g_app_started) {
+        if (g_open_name_portal) {
+            g_open_name_portal = false;
+            ESP_LOGI(TAG, "BUTTON_B pressed — opening name-entry portal");
+            char new_nick[33] = {0};
+            if (name_portal_run(new_nick, sizeof(new_nick))) {
+                strncpy(nickname, new_nick, sizeof(nickname) - 1);
+                nickname[sizeof(nickname) - 1] = '\0';
+                ui_set_nickname(nickname);
+                ui_set_name_configured(true);
+            }
+            /* Repaint splash and re-arm the splash handler (the portal
+             * temporarily took over the button callback). */
+            ui_show_splash();
+            buttons_register_callback(splash_button_event);
+        }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     ESP_LOGI(TAG, "BUTTON_A pressed — starting BLE.");
