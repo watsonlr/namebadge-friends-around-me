@@ -23,6 +23,7 @@
 #define COLOR_GREEN   0x07E0
 #define COLOR_BLUE    0x001F
 #define COLOR_YELLOW  0xFFE0
+#define COLOR_LIGHT_YELLOW 0xFFFC   /* near-white pastel yellow */
 #define COLOR_CYAN    0x07FF
 #define COLOR_MAGENTA 0xF81F
 #define COLOR_GRAY    0x8410

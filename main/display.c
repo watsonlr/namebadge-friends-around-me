@@ -8,6 +8,21 @@
  * NOTE: CS shares GPIO 0 with the BOOT button. RST must be asserted LOW
  * before spi_bus_add_device() so any CS glitches during pin reconfig are
  * ignored by the panel (which is held in hardware reset).
+ *
+ * SPI CLOCK — must stay ≤ 10 MHz for OTA installs:
+ *   At 40 MHz the panel works perfectly when the app is flashed bare-metal
+ *   (USB or webflash Single Program Flash) but the very first MADCTL write
+ *   fails after an OTA install (handed off from the BYUI loader via
+ *   esp_restart). The chip ends up running with default MADCTL=0x00 instead
+ *   of the intended 0x60, so the splash and friends UI render rotated 90° CW
+ *   and horizontally mirrored. Hardware reset still happens (RST pad goes
+ *   LOW/HIGH, init_regs runs to "Display ready" with no SPI errors), so the
+ *   command "succeeds" at the controller but the panel apparently doesn't
+ *   latch it at 40 MHz right after the loader's hand-off — most likely a
+ *   signal-integrity / setup-time margin that's tight on the flex cable
+ *   and only fails once the panel has already been driven at speed by the
+ *   loader. Dropping the clock to 10 MHz makes both paths reliable. If you
+ *   ever raise this, retest BOTH cold-boot and OTA-install paths.
  */
 
 #include "display.h"
@@ -26,7 +41,7 @@
 #define DISP_PIN_MOSI  3
 #define DISP_PIN_MISO  -1   /* write-only — no MISO on this display */
 #define DISP_SPI_HOST  SPI2_HOST
-#define DISP_SPI_FREQ  SPI_MASTER_FREQ_10M  /* lowered from 40M to test OTA orientation bug */
+#define DISP_SPI_FREQ  SPI_MASTER_FREQ_10M  /* see header comment — do not raise without retesting OTA path */
 
 static const char *TAG = "display";
 static spi_device_handle_t s_spi;

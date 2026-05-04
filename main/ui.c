@@ -103,23 +103,27 @@ static void draw_announcement(const char *nickname, announcement_kind_t kind)
 }
 
 /**
- * @brief Draw the two-line header (title + "I am: <nick>") on a blue bg.
+ * @brief Draw the two-line header (title + "I am: <nick>"). Background
+ * is blue in the to-meet view, light-yellow in the met view.
  */
 static void draw_header(void)
 {
-    display_fill_rect(0, 0, DISPLAY_WIDTH, HEADER_HEIGHT, COLOR_BLUE);
+    bool met_view = (current_view == VIEW_MET);
+    uint16_t bg = met_view ? COLOR_LIGHT_YELLOW : COLOR_BLUE;
+    uint16_t fg = met_view ? COLOR_BLACK        : COLOR_WHITE;
+
+    display_fill_rect(0, 0, DISPLAY_WIDTH, HEADER_HEIGHT, bg);
 
     /* Title line — "Friends to Meet" / "Friends I've Met". Same scale-2
      * font as the nickname line; "Badge Friends to Meet" was 21 chars and
      * would overrun 320 px so the wording is shortened to fit. */
-    const char *title = (current_view == VIEW_MET)
-        ? " Friends I've Met" : " Friends to Meet";
-    display_draw_string(5, 5, title, COLOR_WHITE, COLOR_BLUE, 2);
+    const char *title = met_view ? " Friends I've Met" : " Friends to Meet";
+    display_draw_string(5, 5, title, fg, bg, 2);
 
     /* "I am: <nick>" line below the title. */
     char header_text[50];
     snprintf(header_text, sizeof(header_text), " I am: %s", user_nickname);
-    display_draw_string(5, 32, header_text, COLOR_WHITE, COLOR_BLUE, 2);
+    display_draw_string(5, 32, header_text, fg, bg, 2);
 
     display_draw_hline(0, HEADER_HEIGHT, DISPLAY_WIDTH, COLOR_WHITE);
 }
@@ -406,14 +410,18 @@ void ui_refresh(void)
 
     flash_summary_t fs = scan_flash_summary();
 
-    /* LEDs follow scan state every tick — even during an overlay — so a
-     * "Hello from X" greeting can blink the bar green at the same time. */
-    if (fs.any_flashing) blink_tick++;
+    /* Drive the LED bar each tick:
+     *   green  → only while the "Hello from X" overlay is on screen
+     *            (matches the message duration, not the full FIND window)
+     *   yellow → while at least one row is flashing for an incoming meet
+     *   off    → otherwise */
+    bool hello_active = (announce_active && announcement_kind == ANN_HELLO_FROM);
+    if (fs.any_flashing || hello_active) blink_tick++;
     bool blink_on = (blink_tick & 1) == 0;
-    if (blink_on && fs.incoming_find) {
-        leds_fill(0, 8, 0);
+    if (blink_on && hello_active) {
+        leds_fill(0, 8, 0);   /* low-intensity green */
     } else if (blink_on && fs.incoming_meet) {
-        leds_fill(8, 6, 0);
+        leds_fill(8, 6, 0);   /* low-intensity yellow */
     } else {
         leds_clear();
     }
